@@ -12,11 +12,11 @@ Minimal Python MCP server for Readwise integration - token-efficient, single-fil
 
 ## Installation
 
-### 1. Clone or create directory
+### 1. Clone repository
 
 ```bash
-mkdir -p /Users/ngpestelos/src/readwise-mcp-server
-cd /Users/ngpestelos/src/readwise-mcp-server
+git clone https://github.com/ngpestelos/readwise-mcp-server.git
+cd readwise-mcp-server
 ```
 
 ### 2. Create virtual environment
@@ -37,28 +37,30 @@ pip install -r requirements.txt
 Set these in your `.mcp.json` file:
 
 - `READWISE_TOKEN`: Your Readwise API token
-- `VAULT_PATH`: Path to your PARA vault (e.g., `/Users/ngpestelos/src/PARA`)
+- `VAULT_PATH`: Path to your PARA vault (e.g., `/path/to/your/vault`)
 
 ## Configuration
 
 ### Update .mcp.json
 
-Replace the existing `readwise` entry in `/Users/ngpestelos/src/PARA/.mcp.json`:
+Add or update the `readwise` entry in your vault's `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "readwise": {
-      "command": "/Users/ngpestelos/src/readwise-mcp-server/venv/bin/python",
-      "args": ["/Users/ngpestelos/src/readwise-mcp-server/server.py"],
+      "command": "/absolute/path/to/readwise-mcp-server/venv/bin/python",
+      "args": ["/absolute/path/to/readwise-mcp-server/server.py"],
       "env": {
         "READWISE_TOKEN": "your_token_here",
-        "VAULT_PATH": "/Users/ngpestelos/src/PARA"
+        "VAULT_PATH": "/absolute/path/to/your/vault"
       }
     }
   }
 }
 ```
+
+Replace the paths with your actual installation locations.
 
 ## Tools Reference
 
