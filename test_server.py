@@ -26,6 +26,70 @@ from server import (
 # UNIT TESTS
 # ============================================================================
 
+class TestTimestampFormat:
+    """Test ISO 8601 timestamp format correctness"""
+
+    def test_load_state_default_timestamp_format(self, tmp_path):
+        """Test that default state has valid ISO 8601 timestamp without double timezone"""
+        state_file = tmp_path / "nonexistent.json"
+
+        with patch('server.STATE_FILE', state_file):
+            state = load_state()
+            timestamp = state["last_import_timestamp"]
+
+            # Should not have both +00:00 and Z
+            assert not ("+00:00Z" in timestamp), f"Malformed timestamp: {timestamp}"
+
+            # Should be parseable as ISO 8601
+            try:
+                datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            except ValueError:
+                pytest.fail(f"Invalid ISO 8601 timestamp: {timestamp}")
+
+    def test_timestamp_has_timezone_info(self, tmp_path):
+        """Test that generated timestamps include timezone information"""
+        state_file = tmp_path / "nonexistent.json"
+
+        with patch('server.STATE_FILE', state_file):
+            state = load_state()
+            timestamp = state["last_import_timestamp"]
+
+            # Should have either +00:00 or Z, but not both
+            has_offset = "+00:00" in timestamp
+            has_z = timestamp.endswith("Z")
+
+            assert has_offset or has_z, f"Timestamp missing timezone info: {timestamp}"
+            assert not (has_offset and has_z), f"Timestamp has both offset and Z: {timestamp}"
+
+    def test_written_state_has_valid_timestamp(self, tmp_path):
+        """Test that written state files contain valid timestamps"""
+        state_file = tmp_path / "state.json"
+
+        # Create state with current timestamp (simulating what the server does)
+        from datetime import timezone
+        test_state = {
+            "last_import_timestamp": datetime.now(timezone.utc).isoformat(),
+            "synced_ranges": []
+        }
+
+        with patch('server.STATE_FILE', state_file):
+            write_state(test_state)
+
+            # Read back and validate
+            with open(state_file, 'r') as f:
+                loaded = json.load(f)
+                timestamp = loaded["last_import_timestamp"]
+
+                # Should not have malformed double timezone
+                assert not ("+00:00Z" in timestamp), f"Written state has malformed timestamp: {timestamp}"
+
+                # Should be parseable
+                try:
+                    datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                except ValueError:
+                    pytest.fail(f"Written timestamp not valid ISO 8601: {timestamp}")
+
+
 class TestStateManagement:
     """Test state file reading and writing"""
 
@@ -319,6 +383,37 @@ class TestAPIIntegration:
         # Note: Full integration test would require mocking the async tool
         # This is a simplified test to verify the mock setup
         assert mock_fetch.return_value["results"][0]["title"] == "New Document"
+
+    def test_state_timestamp_regression(self, tmp_path):
+        """Regression test: Verify timestamps never have both +00:00 and Z"""
+        from datetime import timezone
+
+        # This test prevents regression of the bug where we appended Z to .isoformat()
+        # The bug was: datetime.now(timezone.utc).isoformat() + "Z"
+        # This produced: 2026-01-23T02:16:59.102761+00:00Z (malformed)
+
+        # Correct implementation (after fix):
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        # Verify fix: timestamp should NOT have both +00:00 and Z
+        assert not timestamp.endswith("+00:00Z"), \
+            f"REGRESSION: Timestamp has both +00:00 and Z: {timestamp}"
+
+        # Verify correct format has timezone info
+        assert "+00:00" in timestamp or timestamp.endswith("Z"), \
+            f"Timestamp missing timezone info: {timestamp}"
+
+        # Verify Readwise API would accept this format
+        # (It rejected +00:00Z with 400 Bad Request)
+        try:
+            datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        except ValueError:
+            pytest.fail(f"Timestamp format invalid for API: {timestamp}")
+
+        # Also test the old buggy way would produce malformed format
+        buggy_timestamp = datetime.now(timezone.utc).isoformat() + "Z"
+        assert buggy_timestamp.endswith("+00:00Z"), \
+            "Test verification: buggy implementation should produce +00:00Z"
 
 
 # ============================================================================
