@@ -52,7 +52,7 @@ def load_state() -> Dict:
         with open(STATE_FILE, 'r') as f:
             return json.load(f)
     return {
-        "last_import_timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+        "last_import_timestamp": datetime.now(timezone.utc).isoformat(),
         "synced_ranges": [],
         "backfill_in_progress": False
     }
@@ -309,7 +309,7 @@ async def readwise_import_recent(category: str = "tweet", limit: int = 20) -> di
 
         # Update state
         if results:
-            state["last_import_timestamp"] = datetime.now(timezone.utc).isoformat() + "Z"
+            state["last_import_timestamp"] = datetime.now(timezone.utc).isoformat()
             write_state(state)
 
         return {
@@ -407,7 +407,7 @@ async def readwise_backfill(target_date: str, category: str = "tweet") -> dict:
                 break
 
         # Update state
-        state["last_import_timestamp"] = datetime.now(timezone.utc).isoformat() + "Z"
+        state["last_import_timestamp"] = datetime.now(timezone.utc).isoformat()
         write_state(state)
 
         return {
@@ -548,7 +548,7 @@ async def readwise_init_ranges() -> dict:
             "start": dates[0].isoformat(),
             "end": dates[-1].isoformat(),
             "doc_count": len(docs_with_dates),
-            "verified_at": datetime.now(timezone.utc).isoformat() + "Z"
+            "verified_at": datetime.now(timezone.utc).isoformat()
         }
 
         # Update state
@@ -574,7 +574,7 @@ async def readwise_reset_state(clear_ranges: bool = False) -> dict:
         if clear_ranges:
             # Full reset
             new_state = {
-                "last_import_timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+                "last_import_timestamp": datetime.now(timezone.utc).isoformat(),
                 "synced_ranges": [],
                 "backfill_in_progress": False
             }
@@ -582,7 +582,7 @@ async def readwise_reset_state(clear_ranges: bool = False) -> dict:
             # Preserve ranges
             state = load_state()
             new_state = {
-                "last_import_timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+                "last_import_timestamp": datetime.now(timezone.utc).isoformat(),
                 "synced_ranges": state.get("synced_ranges", []),
                 "backfill_in_progress": False
             }
