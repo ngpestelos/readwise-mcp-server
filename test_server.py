@@ -226,6 +226,237 @@ class TestFilenameHandling:
         assert extract_id_from_url("") is None
 
 
+class TestFilenameQmdValidation:
+    r"""
+    Test filename sanitization fixes for qmd indexer validation.
+
+    The qmd indexer requires filenames to contain at least one alphanumeric
+    character (/[\p{L}\p{N}]/u regex). These tests verify the fix for
+    documents with titles containing only special characters (emoji, ellipsis, etc.).
+
+    Regression prevention for issue: handelize: path has no valid filename content
+    """
+
+    def test_ellipsis_only_title(self):
+        """Test that ellipsis-only title generates valid filename"""
+        doc = {
+            "title": "…",
+            "author": "Take Action!",
+            "saved_at": "2025-12-08T00:00:00Z",
+            "category": "tweet"
+        }
+
+        result = sanitize_filename("…", doc)
+
+        # Should use fallback with author and date
+        assert result == "Tweet by Take Action! - 2025-12-08.md"
+
+        # Should pass qmd validation (has alphanumeric characters)
+        filename_without_ext = result[:-3]  # Remove .md
+        assert any(c.isalnum() for c in filename_without_ext), \
+            f"Filename '{result}' has no alphanumeric characters"
+
+    def test_emoji_only_title(self):
+        """Test that emoji-only title generates valid filename"""
+        doc = {
+            "title": "🍿🍿",
+            "author": "Elon Musk",
+            "saved_at": "2025-12-06T00:00:00Z",
+            "category": "tweet"
+        }
+
+        result = sanitize_filename("🍿🍿", doc)
+
+        assert result == "Tweet by Elon Musk - 2025-12-06.md"
+
+        # Verify qmd validation
+        filename_without_ext = result[:-3]
+        assert any(c.isalnum() for c in filename_without_ext), \
+            f"Filename '{result}' has no alphanumeric characters"
+
+    def test_empty_title(self):
+        """Test that empty title generates valid filename"""
+        doc = {
+            "title": "",
+            "author": "x.com",
+            "saved_at": "2025-12-05T00:00:00Z",
+            "category": "tweet"
+        }
+
+        result = sanitize_filename("", doc)
+
+        assert result == "Tweet by x.com - 2025-12-05.md"
+
+        # Verify qmd validation
+        filename_without_ext = result[:-3]
+        assert any(c.isalnum() for c in filename_without_ext), \
+            f"Filename '{result}' has no alphanumeric characters"
+
+    def test_whitespace_only_title(self):
+        """Test that whitespace-only title generates valid filename"""
+        doc = {
+            "title": "   ",
+            "author": "TestUser",
+            "saved_at": "2025-12-01T00:00:00Z",
+            "category": "tweet"
+        }
+
+        result = sanitize_filename("   ", doc)
+
+        # Should use fallback
+        assert "Tweet by TestUser - 2025-12-01.md" == result
+
+        # Verify qmd validation
+        filename_without_ext = result[:-3]
+        assert any(c.isalnum() for c in filename_without_ext)
+
+    def test_special_chars_only_title(self):
+        """Test title with only special characters"""
+        doc = {
+            "title": "!@#$%^&*()",
+            "author": "SpecialUser",
+            "saved_at": "2025-12-02T00:00:00Z",
+            "category": "tweet"
+        }
+
+        result = sanitize_filename("!@#$%^&*()", doc)
+
+        # Should use fallback
+        assert "Tweet by SpecialUser - 2025-12-02.md" == result
+
+        # Verify qmd validation
+        filename_without_ext = result[:-3]
+        assert any(c.isalnum() for c in filename_without_ext)
+
+    def test_article_category_fallback(self):
+        """Test fallback uses category-specific label for articles"""
+        doc = {
+            "title": "…",
+            "author": "Blog Author",
+            "saved_at": "2025-12-03T00:00:00Z",
+            "category": "article"
+        }
+
+        result = sanitize_filename("…", doc)
+
+        assert result == "Article by Blog Author - 2025-12-03.md"
+        assert any(c.isalnum() for c in result[:-3])
+
+    def test_pdf_category_fallback(self):
+        """Test fallback uses category-specific label for PDFs"""
+        doc = {
+            "title": "🔥",
+            "author": "PDF Author",
+            "saved_at": "2025-12-04T00:00:00Z",
+            "category": "pdf"
+        }
+
+        result = sanitize_filename("🔥", doc)
+
+        assert result == "Pdf by PDF Author - 2025-12-04.md"
+        assert any(c.isalnum() for c in result[:-3])
+
+    def test_no_doc_fallback(self):
+        """Test fallback when doc parameter is not provided"""
+        result = sanitize_filename("…", None)
+
+        # Should use generic fallback with timestamp
+        assert result.startswith("Untitled - ")
+        assert result.endswith(".md")
+
+        # Should have date in format YYYY-MM-DD
+        filename_without_ext = result[:-3]
+        assert any(c.isalnum() for c in filename_without_ext)
+
+    def test_author_with_special_chars(self):
+        """Test that author names with special chars are sanitized"""
+        doc = {
+            "title": "…",
+            "author": "User/Name:Test",
+            "saved_at": "2025-12-05T00:00:00Z",
+            "category": "tweet"
+        }
+
+        result = sanitize_filename("…", doc)
+
+        # Author special chars should be removed
+        assert "/" not in result
+        assert ":" not in result
+        assert "Tweet by UserNameTest - 2025-12-05.md" == result
+
+    def test_very_long_author_name(self):
+        """Test that author names are truncated to 30 chars"""
+        doc = {
+            "title": "…",
+            "author": "A" * 50,  # 50 character author name
+            "saved_at": "2025-12-06T00:00:00Z",
+            "category": "tweet"
+        }
+
+        result = sanitize_filename("…", doc)
+
+        # Author should be truncated to 30 chars
+        expected = f"Tweet by {'A' * 30} - 2025-12-06.md"
+        assert result == expected
+
+    def test_mixed_valid_invalid_chars(self):
+        """Test title with mix of valid and invalid chars still uses original"""
+        # This should NOT use fallback because it has some alphanumeric
+        result = sanitize_filename("Hello 🍿 World", None)
+
+        # Should use original title (cleaned up)
+        assert result == "Hello 🍿 World.md"
+        assert any(c.isalnum() for c in result[:-3])
+
+    def test_qmd_validation_regression(self):
+        """
+        Regression test: Verify all problematic cases that caused qmd errors
+        now produce valid filenames.
+
+        This prevents regression of the bug where qmd indexer failed with:
+        "handelize: path has no valid filename content"
+        """
+        problematic_cases = [
+            ("…", {"author": "User1", "saved_at": "2025-12-08", "category": "tweet"}),
+            ("🍿🍿", {"author": "User2", "saved_at": "2025-12-06", "category": "tweet"}),
+            ("", {"author": "User3", "saved_at": "2025-12-05", "category": "tweet"}),
+            ("   ", {"author": "User4", "saved_at": "2025-12-04", "category": "tweet"}),
+            ("...", {"author": "User5", "saved_at": "2025-12-03", "category": "tweet"}),
+            ("---", {"author": "User6", "saved_at": "2025-12-02", "category": "tweet"}),
+        ]
+
+        for title, doc in problematic_cases:
+            result = sanitize_filename(title, doc)
+            filename_without_ext = result[:-3]
+
+            # Critical: Must have at least one alphanumeric character
+            has_alnum = any(c.isalnum() for c in filename_without_ext)
+            assert has_alnum, \
+                f"REGRESSION: Title '{title}' produced invalid filename '{result}' " \
+                f"with no alphanumeric characters"
+
+    def test_save_document_with_invalid_title(self, tmp_path):
+        """Integration test: Verify save_document works with invalid titles"""
+        doc = {
+            "title": "…",
+            "author": "Test Author",
+            "saved_at": "2025-12-08T00:00:00Z",
+            "category": "tweet",
+            "content": "Test content"
+        }
+
+        filepath = save_document(doc, tmp_path)
+
+        # Should create file with fallback name
+        assert filepath.exists()
+        assert filepath.name == "Tweet by Test Author - 2025-12-08.md"
+
+        # Verify qmd would accept this filename
+        filename_without_ext = filepath.name[:-3]
+        assert any(c.isalnum() for c in filename_without_ext), \
+            f"Saved file '{filepath.name}' would fail qmd validation"
+
+
 class TestDocumentScanning:
     """Test filesystem scanning for deduplication"""
 

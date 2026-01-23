@@ -125,14 +125,44 @@ def scan_existing_documents() -> Tuple[set, set]:
 
     return known_ids, known_filenames
 
-def sanitize_filename(title: str) -> str:
-    """Sanitize title for filename"""
+def sanitize_filename(title: str, doc: Optional[Dict] = None) -> str:
+    """
+    Sanitize title for filename with fallback for invalid names.
+
+    Args:
+        title: The document title to sanitize
+        doc: Optional document dict for fallback metadata (author, saved_at)
+
+    Returns:
+        Sanitized filename ending in .md
+    """
     # Replace special characters
     filename = title.replace('/', '-').replace(':', ' -')
     # Remove invalid characters
     filename = re.sub(r'[<>"\\\|?*]', '', filename)
     # Trim to 100 characters
     filename = filename[:100].strip()
+
+    # Check if filename has at least one alphanumeric character
+    if not any(c.isalnum() for c in filename):
+        # Fallback: use author + date or generic name
+        if doc:
+            author = doc.get('author', 'Unknown')
+            # Sanitize author name
+            author = re.sub(r'[<>"\\\|?*/:]', '', author)[:30].strip()
+
+            saved_at = doc.get('saved_at', '')
+            date_str = saved_at[:10] if saved_at else datetime.now().strftime('%Y-%m-%d')
+
+            # Use category to make name more descriptive
+            category = doc.get('category', 'Document')
+            category_label = 'Tweet' if category == 'tweet' else category.capitalize()
+
+            filename = f"{category_label} by {author} - {date_str}"
+        else:
+            # Generic fallback
+            filename = f"Untitled - {datetime.now().strftime('%Y-%m-%d-%H%M%S')}"
+
     return filename + ".md"
 
 def extract_id_from_url(url: Optional[str]) -> Optional[str]:
@@ -199,7 +229,7 @@ def save_document(doc: Dict, directory: Path) -> Path:
     """Save document as markdown file"""
     directory.mkdir(parents=True, exist_ok=True)
 
-    filename = sanitize_filename(doc["title"])
+    filename = sanitize_filename(doc.get("title", ""), doc)
     filepath = directory / filename
 
     # Handle filename collisions
@@ -292,7 +322,7 @@ async def readwise_import_recent(category: str = "tweet", limit: int = 20) -> di
         for doc in results:
             # Check deduplication
             doc_id = extract_id_from_url(doc.get("readwise_url"))
-            filename = sanitize_filename(doc["title"])
+            filename = sanitize_filename(doc.get("title", ""), doc)
 
             if doc_id in known_ids or filename in known_filenames:
                 skipped += 1
@@ -383,7 +413,7 @@ async def readwise_backfill(target_date: str, category: str = "tweet") -> dict:
 
                 # Deduplicate
                 doc_id = extract_id_from_url(doc.get("readwise_url"))
-                filename = sanitize_filename(doc["title"])
+                filename = sanitize_filename(doc.get("title", ""), doc)
 
                 if doc_id in known_ids or filename in known_filenames:
                     skipped += 1
