@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 ngpestelos
+# Licensed under the MIT License - see LICENSE file for details
 """
 Minimal Python Readwise MCP Server
 Token-efficient, single-file implementation using FastMCP
