@@ -280,15 +280,18 @@ class TestFilenameHandling:
         assert extract_id_from_url("") is None
 
 
-class TestFilenameQmdValidation:
-    r"""
-    Test filename sanitization fixes for qmd indexer validation.
+class TestFilenameValidity:
+    """
+    Test filename sanitization for human-readable, cross-platform compatibility.
 
-    The qmd indexer requires filenames to contain at least one alphanumeric
-    character (/[\p{L}\p{N}]/u regex). These tests verify the fix for
-    documents with titles containing only special characters (emoji, ellipsis, etc.).
+    Filenames should contain at least one alphanumeric character for:
+    - Human readability in file listings
+    - Shell tab completion
+    - Cross-platform compatibility
+    - Proper sorting and searching
 
-    Regression prevention for issue: handelize: path has no valid filename content
+    These tests verify the fallback mechanism for documents with titles
+    containing only special characters (emoji, ellipsis, etc.).
     """
 
     def test_ellipsis_only_title(self):
@@ -305,7 +308,7 @@ class TestFilenameQmdValidation:
         # Should use fallback with author and date
         assert result == "Tweet by Take Action! - 2025-12-08.md"
 
-        # Should pass qmd validation (has alphanumeric characters)
+        # Should have alphanumeric characters for readability
         filename_without_ext = result[:-3]  # Remove .md
         assert any(c.isalnum() for c in filename_without_ext), \
             f"Filename '{result}' has no alphanumeric characters"
@@ -323,7 +326,7 @@ class TestFilenameQmdValidation:
 
         assert result == "Tweet by Elon Musk - 2025-12-06.md"
 
-        # Verify qmd validation
+        # Verify filename has alphanumeric content
         filename_without_ext = result[:-3]
         assert any(c.isalnum() for c in filename_without_ext), \
             f"Filename '{result}' has no alphanumeric characters"
@@ -341,7 +344,7 @@ class TestFilenameQmdValidation:
 
         assert result == "Tweet by x.com - 2025-12-05.md"
 
-        # Verify qmd validation
+        # Verify filename has alphanumeric content
         filename_without_ext = result[:-3]
         assert any(c.isalnum() for c in filename_without_ext), \
             f"Filename '{result}' has no alphanumeric characters"
@@ -360,7 +363,7 @@ class TestFilenameQmdValidation:
         # Should use fallback
         assert "Tweet by TestUser - 2025-12-01.md" == result
 
-        # Verify qmd validation
+        # Verify filename has alphanumeric content
         filename_without_ext = result[:-3]
         assert any(c.isalnum() for c in filename_without_ext)
 
@@ -378,7 +381,7 @@ class TestFilenameQmdValidation:
         # Should use fallback
         assert "Tweet by SpecialUser - 2025-12-02.md" == result
 
-        # Verify qmd validation
+        # Verify filename has alphanumeric content
         filename_without_ext = result[:-3]
         assert any(c.isalnum() for c in filename_without_ext)
 
@@ -462,13 +465,14 @@ class TestFilenameQmdValidation:
         assert result == "Hello 🍿 World.md"
         assert any(c.isalnum() for c in result[:-3])
 
-    def test_qmd_validation_regression(self):
+    def test_invalid_title_regression(self):
         """
-        Regression test: Verify all problematic cases that caused qmd errors
-        now produce valid filenames.
+        Regression test: Verify all problematic cases with invalid titles
+        now produce valid, human-readable filenames.
 
-        This prevents regression of the bug where qmd indexer failed with:
-        "handelize: path has no valid filename content"
+        These titles (emoji-only, empty, special characters) previously
+        created filenames that were not cross-platform compatible and
+        difficult for users to work with in shell environments.
         """
         problematic_cases = [
             ("…", {"author": "User1", "saved_at": "2025-12-08", "category": "tweet"}),
@@ -505,10 +509,10 @@ class TestFilenameQmdValidation:
         assert filepath.exists()
         assert filepath.name == "Tweet by Test Author - 2025-12-08.md"
 
-        # Verify qmd would accept this filename
+        # Verify filename is valid and human-readable
         filename_without_ext = filepath.name[:-3]
         assert any(c.isalnum() for c in filename_without_ext), \
-            f"Saved file '{filepath.name}' would fail qmd validation"
+            f"Saved file '{filepath.name}' has no alphanumeric characters"
 
 
 class TestDocumentScanning:
