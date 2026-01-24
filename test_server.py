@@ -160,7 +160,7 @@ class TestOptimization:
         assert optimized_after is None
 
     def test_optimize_target_before_range(self):
-        """Test optimization when target is before synced range"""
+        """Test optimization when target is before synced range (gap filling)"""
         synced_ranges = [
             {
                 "start": "2026-01-15T00:00:00+00:00",
@@ -170,7 +170,9 @@ class TestOptimization:
         ]
         should_proceed, optimized_after = optimize_backfill("2026-01-10", synced_ranges)
         assert should_proceed == True
-        assert optimized_after == "2026-01-21T00:00:00+00:00"
+        # Should return None to allow pagination to fill the gap
+        # Deduplication will handle overlap with synced range
+        assert optimized_after is None
 
     def test_optimize_target_after_range(self):
         """Test optimization when target is after synced range"""
@@ -183,6 +185,58 @@ class TestOptimization:
         ]
         should_proceed, optimized_after = optimize_backfill("2026-01-20", synced_ranges)
         assert should_proceed == True
+        assert optimized_after is None
+
+    def test_optimize_gap_filling_bug_scenario(self):
+        """
+        Test the specific bug scenario that was fixed:
+        Target: Aug 1, 2025
+        Synced range: Dec 1, 2025 - Jan 21, 2026
+
+        Expected: Should return (True, None) to fill the gap
+        Bug was: Returned (True, range.end) which skipped the gap
+
+        This test verifies the fix for commit e953e71
+        """
+        synced_ranges = [
+            {
+                "start": "2025-12-01T02:07:57.309000+00:00",
+                "end": "2026-01-21T07:28:56.317000+00:00",
+                "doc_count": 1008
+            }
+        ]
+
+        should_proceed, optimized_after = optimize_backfill("2025-08-01", synced_ranges)
+
+        # Should proceed to fill the gap
+        assert should_proceed == True
+
+        # Critical: Should NOT use range.end as filter
+        # This was the bug - it would return "2026-01-21T07:28:56.317000+00:00"
+        # which told API to only fetch documents AFTER Jan 21, completely missing Aug-Nov
+        assert optimized_after is None, \
+            "Bug: optimize_backfill should return None for gap filling, not range.end"
+
+    def test_optimize_multiple_ranges_finds_correct_gap(self):
+        """Test with multiple synced ranges - should identify gap correctly"""
+        synced_ranges = [
+            {
+                "start": "2025-01-01T00:00:00+00:00",
+                "end": "2025-03-31T00:00:00+00:00",
+                "doc_count": 200
+            },
+            {
+                "start": "2025-12-01T00:00:00+00:00",
+                "end": "2026-01-21T00:00:00+00:00",
+                "doc_count": 1000
+            }
+        ]
+
+        # Target between ranges (gap exists)
+        should_proceed, optimized_after = optimize_backfill("2025-08-01", synced_ranges)
+
+        assert should_proceed == True
+        # Should paginate to fill gap, not use any range filter
         assert optimized_after is None
 
 
