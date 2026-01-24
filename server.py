@@ -90,8 +90,13 @@ def optimize_backfill(target_date: str, synced_ranges: List[Dict]) -> Tuple[bool
 
         # Case 2: Target date is before synced range
         if target_ts < range_start:
-            logger.info(f"Optimization available: will use updatedAfter={range_item['end']}")
-            return (True, range_item['end'])  # Optimize - skip synced portion
+            # Gap exists between target and synced range start
+            # Don't use updatedAfter - we need to fill the gap
+            # Pagination will stop when hitting target date
+            # Deduplication will handle overlap with synced range
+            logger.info(f"Gap detected: target {target_date} is before synced range {range_item['start']}")
+            logger.info(f"Will paginate to fill gap (no updatedAfter filter)")
+            return (True, None)  # No filter - fill the gap
 
     # Case 3: Target date is after all ranges
     return (True, None)
