@@ -7,9 +7,10 @@ Unit and integration tests for Readwise MCP Server
 
 import json
 import pytest
+import time
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import Mock, patch, mock_open
+from unittest.mock import Mock, patch, mock_open, MagicMock
 import tempfile
 import os
 
@@ -19,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from server import (
     load_state, write_state, optimize_backfill, scan_existing_documents,
     sanitize_filename, extract_id_from_url, format_document_markdown,
-    save_document
+    save_document, fetch_api
 )
 
 # ============================================================================
@@ -703,6 +704,302 @@ class TestAPIIntegration:
         buggy_timestamp = datetime.now(timezone.utc).isoformat() + "Z"
         assert buggy_timestamp.endswith("+00:00Z"), \
             "Test verification: buggy implementation should produce +00:00Z"
+
+
+class TestRateLimitHandling:
+    """Test rate limit retry logic and exponential backoff"""
+
+    @patch('server.requests.get')
+    @patch('server.time.sleep')
+    def test_fetch_api_success_no_retry(self, mock_sleep, mock_get):
+        """Test successful API call requires no retry"""
+        # Mock successful response
+        mock_response = Mock()
+        mock_response.json.return_value = {"results": [{"title": "Test"}]}
+        mock_response.status_code = 200
+        mock_get.return_value = mock_response
+
+        result = fetch_api("/list/", params={"limit": 10})
+
+        # Should succeed on first attempt
+        assert result == {"results": [{"title": "Test"}]}
+        assert mock_get.call_count == 1
+        assert mock_sleep.call_count == 0
+
+    @patch('server.requests.get')
+    @patch('server.time.sleep')
+    def test_fetch_api_retry_on_429(self, mock_sleep, mock_get):
+        """Test retry logic on 429 rate limit error"""
+        from requests.exceptions import HTTPError
+
+        # First call: 429 error
+        mock_response_429 = Mock()
+        mock_response_429.status_code = 429
+        mock_response_429.headers = {}
+        mock_response_429.raise_for_status.side_effect = HTTPError(response=mock_response_429)
+
+        # Second call: success
+        mock_response_200 = Mock()
+        mock_response_200.json.return_value = {"results": [{"title": "Test"}]}
+        mock_response_200.status_code = 200
+
+        mock_get.side_effect = [mock_response_429, mock_response_200]
+
+        result = fetch_api("/list/")
+
+        # Should retry once and succeed
+        assert result == {"results": [{"title": "Test"}]}
+        assert mock_get.call_count == 2
+        assert mock_sleep.call_count == 1
+        # First retry should wait 5 seconds (base delay)
+        mock_sleep.assert_called_with(5)
+
+    @patch('server.requests.get')
+    @patch('server.time.sleep')
+    def test_fetch_api_exponential_backoff(self, mock_sleep, mock_get):
+        """Test exponential backoff: 5s, 10s, 20s"""
+        from requests.exceptions import HTTPError
+
+        # Three 429 errors, then success
+        mock_response_429 = Mock()
+        mock_response_429.status_code = 429
+        mock_response_429.headers = {}
+        mock_response_429.raise_for_status.side_effect = HTTPError(response=mock_response_429)
+
+        mock_response_200 = Mock()
+        mock_response_200.json.return_value = {"results": []}
+        mock_response_200.status_code = 200
+
+        mock_get.side_effect = [
+            mock_response_429,  # Attempt 0 fails
+            mock_response_429,  # Attempt 1 fails
+            mock_response_429,  # Attempt 2 fails
+            mock_response_200   # Attempt 3 succeeds
+        ]
+
+        result = fetch_api("/list/")
+
+        # Should retry 3 times with exponential backoff
+        assert mock_get.call_count == 4
+        assert mock_sleep.call_count == 3
+
+        # Verify exponential backoff: 5s, 10s, 20s
+        sleep_calls = [call[0][0] for call in mock_sleep.call_args_list]
+        assert sleep_calls == [5, 10, 20]
+
+    @patch('server.requests.get')
+    @patch('server.time.sleep')
+    def test_fetch_api_retry_exhaustion(self, mock_sleep, mock_get):
+        """Test that retries are exhausted after max attempts"""
+        from requests.exceptions import HTTPError
+
+        # Always return 429
+        mock_response_429 = Mock()
+        mock_response_429.status_code = 429
+        mock_response_429.headers = {}
+        mock_response_429.raise_for_status.side_effect = HTTPError(response=mock_response_429)
+
+        mock_get.return_value = mock_response_429
+
+        # Should raise after exhausting retries
+        with pytest.raises(HTTPError):
+            fetch_api("/list/")
+
+        # Should try 4 times total (initial + 3 retries)
+        assert mock_get.call_count == 4
+        # Should sleep 3 times (not on last attempt)
+        assert mock_sleep.call_count == 3
+
+    @patch('server.requests.get')
+    @patch('server.time.sleep')
+    def test_fetch_api_respects_retry_after_header(self, mock_sleep, mock_get):
+        """Test that Retry-After header is respected"""
+        from requests.exceptions import HTTPError
+
+        # 429 with Retry-After header
+        mock_response_429 = Mock()
+        mock_response_429.status_code = 429
+        mock_response_429.headers = {'Retry-After': '15'}  # 15 seconds
+        mock_response_429.raise_for_status.side_effect = HTTPError(response=mock_response_429)
+
+        # Success on second attempt
+        mock_response_200 = Mock()
+        mock_response_200.json.return_value = {"results": []}
+        mock_response_200.status_code = 200
+
+        mock_get.side_effect = [mock_response_429, mock_response_200]
+
+        result = fetch_api("/list/")
+
+        # Should use Retry-After value instead of exponential backoff
+        assert mock_sleep.call_count == 1
+        mock_sleep.assert_called_with(15)
+
+    @patch('server.requests.get')
+    @patch('server.time.sleep')
+    def test_fetch_api_caps_max_delay(self, mock_sleep, mock_get):
+        """Test that delay is capped at RATE_LIMIT_MAX_DELAY"""
+        from requests.exceptions import HTTPError
+
+        # Return 429 with very large Retry-After
+        mock_response_429 = Mock()
+        mock_response_429.status_code = 429
+        mock_response_429.headers = {'Retry-After': '120'}  # 2 minutes
+        mock_response_429.raise_for_status.side_effect = HTTPError(response=mock_response_429)
+
+        mock_response_200 = Mock()
+        mock_response_200.json.return_value = {"results": []}
+        mock_response_200.status_code = 200
+
+        mock_get.side_effect = [mock_response_429, mock_response_200]
+
+        result = fetch_api("/list/")
+
+        # Should cap at 60 seconds (RATE_LIMIT_MAX_DELAY)
+        assert mock_sleep.call_count == 1
+        mock_sleep.assert_called_with(60)
+
+    @patch('server.requests.get')
+    @patch('server.time.sleep')
+    def test_fetch_api_no_retry_on_404(self, mock_sleep, mock_get):
+        """Test that 404 errors don't trigger retry"""
+        from requests.exceptions import HTTPError
+
+        mock_response_404 = Mock()
+        mock_response_404.status_code = 404
+        mock_response_404.raise_for_status.side_effect = HTTPError(response=mock_response_404)
+
+        mock_get.return_value = mock_response_404
+
+        # Should raise immediately without retry
+        with pytest.raises(HTTPError):
+            fetch_api("/list/")
+
+        # Should only try once (no retries)
+        assert mock_get.call_count == 1
+        assert mock_sleep.call_count == 0
+
+    @patch('server.requests.get')
+    @patch('server.time.sleep')
+    def test_fetch_api_no_retry_on_500(self, mock_sleep, mock_get):
+        """Test that 500 errors don't trigger retry"""
+        from requests.exceptions import HTTPError
+
+        mock_response_500 = Mock()
+        mock_response_500.status_code = 500
+        mock_response_500.raise_for_status.side_effect = HTTPError(response=mock_response_500)
+
+        mock_get.return_value = mock_response_500
+
+        # Should raise immediately without retry
+        with pytest.raises(HTTPError):
+            fetch_api("/list/")
+
+        # Should only try once (no retries)
+        assert mock_get.call_count == 1
+        assert mock_sleep.call_count == 0
+
+    @patch('server.requests.get')
+    @patch('server.time.sleep')
+    def test_fetch_api_no_retry_on_timeout(self, mock_sleep, mock_get):
+        """Test that timeout errors don't trigger retry"""
+        from requests.exceptions import Timeout
+
+        mock_get.side_effect = Timeout("Connection timeout")
+
+        # Should raise immediately without retry
+        with pytest.raises(Timeout):
+            fetch_api("/list/")
+
+        # Should only try once (no retries)
+        assert mock_get.call_count == 1
+        assert mock_sleep.call_count == 0
+
+    @patch('server.requests.get')
+    def test_fetch_api_includes_timeout(self, mock_get):
+        """Test that requests include timeout parameter"""
+        mock_response = Mock()
+        mock_response.json.return_value = {"results": []}
+        mock_response.status_code = 200
+        mock_get.return_value = mock_response
+
+        fetch_api("/list/", params={"limit": 10})
+
+        # Verify timeout was passed to requests.get
+        call_kwargs = mock_get.call_args[1]
+        assert 'timeout' in call_kwargs
+        assert call_kwargs['timeout'] == 30  # REQUEST_TIMEOUT constant
+
+    @pytest.mark.asyncio
+    @patch('server.fetch_api')
+    @patch('server.time.sleep')
+    async def test_backfill_throttling(self, mock_sleep, mock_fetch):
+        """Test that backfill adds throttling delay between pages"""
+        from server import readwise_backfill
+
+        # Mock two pages of results
+        page1_response = {
+            "results": [
+                {
+                    "title": "Doc 1",
+                    "saved_at": "2026-01-15T00:00:00Z",
+                    "readwise_url": "https://readwise.io/reader/document/1"
+                }
+            ],
+            "nextPageCursor": "cursor123"
+        }
+
+        page2_response = {
+            "results": [
+                {
+                    "title": "Doc 2",
+                    "saved_at": "2026-01-10T00:00:00Z",
+                    "readwise_url": "https://readwise.io/reader/document/2"
+                }
+            ],
+            "nextPageCursor": None
+        }
+
+        mock_fetch.side_effect = [page1_response, page2_response]
+
+        # Mock scan_existing_documents to avoid filesystem access
+        with patch('server.scan_existing_documents', return_value=(set(), set())), \
+             patch('server.save_document'), \
+             patch('server.load_state', return_value={"synced_ranges": []}), \
+             patch('server.write_state'):
+
+            result = await readwise_backfill("2026-01-05", category="tweet")
+
+            # Should fetch 2 pages
+            assert mock_fetch.call_count == 2
+
+            # Should sleep once (after page 2, not page 1)
+            assert mock_sleep.call_count == 1
+            mock_sleep.assert_called_with(0.5)  # PAGINATION_THROTTLE_DELAY
+
+    @patch('server.requests.get')
+    @patch('server.time.sleep')
+    def test_fetch_api_retry_after_invalid_format(self, mock_sleep, mock_get):
+        """Test handling of Retry-After header in HTTP date format"""
+        from requests.exceptions import HTTPError
+
+        # 429 with Retry-After in HTTP date format (not integer)
+        mock_response_429 = Mock()
+        mock_response_429.status_code = 429
+        mock_response_429.headers = {'Retry-After': 'Wed, 21 Oct 2026 07:28:00 GMT'}
+        mock_response_429.raise_for_status.side_effect = HTTPError(response=mock_response_429)
+
+        mock_response_200 = Mock()
+        mock_response_200.json.return_value = {"results": []}
+        mock_response_200.status_code = 200
+
+        mock_get.side_effect = [mock_response_429, mock_response_200]
+
+        result = fetch_api("/list/")
+
+        # Should fall back to exponential backoff (5s for first retry)
+        assert mock_sleep.call_count == 1
+        mock_sleep.assert_called_with(5)
 
 
 # ============================================================================
