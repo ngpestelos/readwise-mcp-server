@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.parse
 import logging
 from datetime import datetime, timezone
@@ -35,6 +36,14 @@ STATE_FILE = VAULT_PATH / ".claude/state/readwise-import.json"
 DOCUMENTS_DIR = VAULT_PATH / "2 Resources/Readwise/Documents"
 DAILY_REVIEWS_DIR = VAULT_PATH / "2 Resources/Readwise/Daily Reviews"
 ARCHIVES_DIR = VAULT_PATH / "3 Archives/Readwise"
+
+# Rate limit configuration
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_BASE_DELAY = 5  # seconds
+RATE_LIMIT_MAX_DELAY = 60  # seconds
+RATE_LIMIT_BACKOFF_MULTIPLIER = 2  # exponential: 5s, 10s, 20s
+REQUEST_TIMEOUT = 30  # seconds
+PAGINATION_THROTTLE_DELAY = 0.5  # seconds between pagination requests
 
 # Validate configuration (only when running as main)
 def validate_config():
@@ -181,7 +190,15 @@ def extract_id_from_url(url: Optional[str]) -> Optional[str]:
 # ============================================================================
 
 def fetch_api(endpoint: str, params: Optional[Dict] = None) -> Dict:
-    """Make authenticated API call to Readwise"""
+    """
+    Make authenticated API call to Readwise with retry on rate limits.
+
+    Implements exponential backoff for 429 rate limit errors.
+    Retries up to RATE_LIMIT_MAX_RETRIES times.
+    Respects Retry-After header if provided by API.
+    """
+    from requests.exceptions import HTTPError
+
     base_url = "https://readwise.io/api/v3"
     url = f"{base_url}{endpoint}"
 
@@ -189,9 +206,65 @@ def fetch_api(endpoint: str, params: Optional[Dict] = None) -> Dict:
         "Authorization": f"Token {READWISE_TOKEN}"
     }
 
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()
-    return response.json()
+    last_exception = None
+
+    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            return response.json()
+
+        except HTTPError as e:
+            last_exception = e
+
+            # Check if this is a rate limit error (429)
+            if e.response is not None and e.response.status_code == 429:
+                # Calculate retry delay
+                retry_after = e.response.headers.get('Retry-After')
+
+                if retry_after:
+                    # Use API-provided delay (in seconds)
+                    try:
+                        delay = int(retry_after)
+                    except ValueError:
+                        # Retry-After might be HTTP date format, fall back to exponential backoff
+                        delay = RATE_LIMIT_BASE_DELAY * (RATE_LIMIT_BACKOFF_MULTIPLIER ** attempt)
+                else:
+                    # Exponential backoff: 5s, 10s, 20s
+                    delay = RATE_LIMIT_BASE_DELAY * (RATE_LIMIT_BACKOFF_MULTIPLIER ** attempt)
+
+                # Cap at max delay
+                delay = min(delay, RATE_LIMIT_MAX_DELAY)
+
+                # Don't retry on last attempt
+                if attempt < RATE_LIMIT_MAX_RETRIES:
+                    logger.warning(
+                        f"Rate limit hit (429) on {endpoint}, "
+                        f"retrying in {delay}s (attempt {attempt + 1}/{RATE_LIMIT_MAX_RETRIES})"
+                    )
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"Rate limit retries exhausted for {endpoint}")
+                    raise
+            else:
+                # Non-429 error, don't retry
+                logger.error(f"API error {e.response.status_code if e.response else 'unknown'}: {e}")
+                raise
+
+        except Exception as e:
+            # Other errors (timeout, connection, etc) - don't retry
+            logger.error(f"Request error for {endpoint}: {e}")
+            raise
+
+    # Should never reach here, but satisfy type checker
+    if last_exception:
+        raise last_exception
 
 def format_document_markdown(doc: Dict) -> str:
     """Convert API document to markdown with YAML frontmatter"""
@@ -403,6 +476,10 @@ async def readwise_backfill(target_date: str, category: str = "tweet") -> dict:
             # Fetch page
             data = fetch_api("/list/", params=params)
             results = data.get("results", [])
+
+            # Throttle between requests (except first page)
+            if page_num > 1:
+                time.sleep(PAGINATION_THROTTLE_DELAY)
 
             if not results:
                 break
