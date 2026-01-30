@@ -898,46 +898,65 @@ async def readwise_import_recent_highlights(limit: int = 100) -> dict:
         # Build API params
         params = {"page_size": min(limit, 1000)}
         if last_import:
-            params["updated__gt"] = last_import
+            params["updatedAfter"] = last_import
 
-        # Fetch highlights (use v2 API)
-        data = fetch_api("/highlights/", params=params, api_version="v2")
-        results = data.get("results", [])
+        # Fetch highlights using export API (includes book metadata)
+        data = fetch_api("/export/", params=params, api_version="v2")
+        books = data.get("results", [])
 
         imported = 0
         skipped = 0
+        total_analyzed = 0
 
-        for highlight in results:
-            # Check deduplication
-            highlight_id = str(highlight.get("id", ""))
+        # Process each book and its highlights
+        for book in books:
+            # Extract book metadata
+            book_title = book.get("title", "Unknown Source")
+            book_author = book.get("author")
+            book_category = book.get("category")
+            book_source_url = book.get("source_url")
 
-            # Generate filename for filename-based dedup check
-            updated_at = highlight.get("updated") or highlight.get("updated_at") or highlight.get("created_at")
-            try:
-                dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
-                timestamp_prefix = dt.strftime("%Y%m%d-%H%M%S")
-            except:
-                timestamp_prefix = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            # Process highlights for this book
+            for highlight in book.get("highlights", []):
+                total_analyzed += 1
 
-            source_title = highlight.get("source_title") or highlight.get("book_title") or "Unknown Source"
-            sanitized_source = sanitize_source_title(source_title, max_length=100)
-            filename = f"{timestamp_prefix} [{sanitized_source}] highlight.md"
+                # Enrich highlight with book metadata
+                highlight["source_title"] = book_title
+                highlight["book_title"] = book_title
+                highlight["author"] = book_author
+                highlight["category"] = book_category
+                highlight["source_type"] = book_category
+                highlight["source_url"] = book_source_url
 
-            if highlight_id in known_ids or filename in known_filenames:
-                skipped += 1
-                continue
+                # Check deduplication
+                highlight_id = str(highlight.get("id", ""))
 
-            # Save highlight
-            save_highlight(highlight, HIGHLIGHTS_DIR)
-            imported += 1
+                # Generate filename for filename-based dedup check
+                updated_at = highlight.get("updated") or highlight.get("updated_at") or highlight.get("created_at")
+                try:
+                    dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+                    timestamp_prefix = dt.strftime("%Y%m%d-%H%M%S")
+                except:
+                    timestamp_prefix = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
-            # Track for session deduplication
-            if highlight_id:
-                known_ids.add(highlight_id)
-            known_filenames.add(filename)
+                sanitized_source = sanitize_source_title(book_title, max_length=100)
+                filename = f"{timestamp_prefix} [{sanitized_source}] highlight.md"
+
+                if highlight_id in known_ids or filename in known_filenames:
+                    skipped += 1
+                    continue
+
+                # Save highlight
+                save_highlight(highlight, HIGHLIGHTS_DIR)
+                imported += 1
+
+                # Track for session deduplication
+                if highlight_id:
+                    known_ids.add(highlight_id)
+                known_filenames.add(filename)
 
         # Update state
-        if results:
+        if total_analyzed > 0:
             highlights_state["last_import_timestamp"] = datetime.now(timezone.utc).isoformat()
             state["highlights"] = highlights_state
             write_state(state)
@@ -946,7 +965,7 @@ async def readwise_import_recent_highlights(limit: int = 100) -> dict:
             "status": "success",
             "imported": imported,
             "skipped": skipped,
-            "total_analyzed": len(results)
+            "total_analyzed": total_analyzed
         }
 
     except Exception as e:
@@ -976,10 +995,10 @@ async def readwise_backfill_highlights(target_date: str) -> dict:
         # Scan existing highlights
         known_ids, known_filenames = scan_existing_highlights()
 
-        # Build base params (v2 API uses page number, not cursor)
+        # Build base params (v2 export API uses page number)
         base_params = {"page_size": 50}
         if optimized_after:
-            base_params["updated__gt"] = optimized_after
+            base_params["updatedAfter"] = optimized_after
 
         # Pagination loop
         page_num = 1
@@ -989,56 +1008,74 @@ async def readwise_backfill_highlights(target_date: str) -> dict:
         reached_target = False
 
         while not reached_target and page_num < 1000:  # Safety limit
-            # Build params for this page (create new dict to avoid mutation issues)
+            # Build params for this page
             params = {**base_params, "page": page_num}
 
-            # Fetch page (v2 API)
-            data = fetch_api("/highlights/", params=params, api_version="v2")
-            results = data.get("results", [])
+            # Fetch page using export API (includes book metadata)
+            data = fetch_api("/export/", params=params, api_version="v2")
+            books = data.get("results", [])
 
             # Throttle between requests (except first page)
             if page_num > 1:
                 time.sleep(PAGINATION_THROTTLE_DELAY)
 
-            if not results:
+            if not books:
                 break
 
-            # Process highlights
-            for highlight in results:
-                # Get highlight date
-                updated_at = highlight.get("updated") or highlight.get("updated_at") or highlight.get("created_at")
-                try:
-                    highlight_date = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
-                except:
-                    # Skip highlights with invalid dates
-                    continue
-
-                # Check if reached target
-                if highlight_date.date() < target_dt.date():
-                    reached_target = True
+            # Process each book and its highlights
+            for book in books:
+                if reached_target:
                     break
 
-                # Deduplicate
-                highlight_id = str(highlight.get("id", ""))
+                # Extract book metadata
+                book_title = book.get("title", "Unknown Source")
+                book_author = book.get("author")
+                book_category = book.get("category")
+                book_source_url = book.get("source_url")
 
-                # Generate filename for dedup check
-                timestamp_prefix = highlight_date.strftime("%Y%m%d-%H%M%S")
-                source_title = highlight.get("source_title") or highlight.get("book_title") or "Unknown Source"
-                sanitized_source = sanitize_source_title(source_title, max_length=100)
-                filename = f"{timestamp_prefix} [{sanitized_source}] highlight.md"
+                # Process highlights for this book
+                for highlight in book.get("highlights", []):
+                    # Enrich highlight with book metadata
+                    highlight["source_title"] = book_title
+                    highlight["book_title"] = book_title
+                    highlight["author"] = book_author
+                    highlight["category"] = book_category
+                    highlight["source_type"] = book_category
+                    highlight["source_url"] = book_source_url
 
-                if highlight_id in known_ids or filename in known_filenames:
-                    skipped += 1
-                    continue
+                    # Get highlight date
+                    updated_at = highlight.get("updated") or highlight.get("updated_at") or highlight.get("created_at")
+                    try:
+                        highlight_date = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+                    except:
+                        # Skip highlights with invalid dates
+                        continue
 
-                # Save highlight
-                save_highlight(highlight, HIGHLIGHTS_DIR)
-                imported += 1
+                    # Check if reached target
+                    if highlight_date.date() < target_dt.date():
+                        reached_target = True
+                        break
 
-                # Track for session deduplication
-                if highlight_id:
-                    known_ids.add(highlight_id)
-                known_filenames.add(filename)
+                    # Deduplicate
+                    highlight_id = str(highlight.get("id", ""))
+
+                    # Generate filename for dedup check
+                    timestamp_prefix = highlight_date.strftime("%Y%m%d-%H%M%S")
+                    sanitized_source = sanitize_source_title(book_title, max_length=100)
+                    filename = f"{timestamp_prefix} [{sanitized_source}] highlight.md"
+
+                    if highlight_id in known_ids or filename in known_filenames:
+                        skipped += 1
+                        continue
+
+                    # Save highlight
+                    save_highlight(highlight, HIGHLIGHTS_DIR)
+                    imported += 1
+
+                    # Track for session deduplication
+                    if highlight_id:
+                        known_ids.add(highlight_id)
+                    known_filenames.add(filename)
 
             if reached_target:
                 break
