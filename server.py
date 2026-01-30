@@ -35,6 +35,7 @@ VAULT_PATH = Path(os.environ.get("VAULT_PATH", "/Users/ngpestelos/src/PARA"))
 STATE_FILE = VAULT_PATH / ".claude/state/readwise-import.json"
 DOCUMENTS_DIR = VAULT_PATH / "2 Resources/Readwise/Documents"
 DAILY_REVIEWS_DIR = VAULT_PATH / "2 Resources/Readwise/Daily Reviews"
+HIGHLIGHTS_DIR = VAULT_PATH / "2 Resources/Readwise/Highlights"
 ARCHIVES_DIR = VAULT_PATH / "3 Archives/Readwise"
 
 # Rate limit configuration
@@ -59,11 +60,24 @@ def load_state() -> Dict:
     """Load state file or create default"""
     if STATE_FILE.exists():
         with open(STATE_FILE, 'r') as f:
-            return json.load(f)
+            state = json.load(f)
+            # Backward compatibility: ensure highlights section exists
+            if "highlights" not in state:
+                state["highlights"] = {
+                    "last_import_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "synced_ranges": [],
+                    "backfill_in_progress": False
+                }
+            return state
     return {
         "last_import_timestamp": datetime.now(timezone.utc).isoformat(),
         "synced_ranges": [],
-        "backfill_in_progress": False
+        "backfill_in_progress": False,
+        "highlights": {
+            "last_import_timestamp": datetime.now(timezone.utc).isoformat(),
+            "synced_ranges": [],
+            "backfill_in_progress": False
+        }
     }
 
 def write_state(state: Dict) -> None:
@@ -189,17 +203,22 @@ def extract_id_from_url(url: Optional[str]) -> Optional[str]:
 # NEW FUNCTIONS (for MCP server)
 # ============================================================================
 
-def fetch_api(endpoint: str, params: Optional[Dict] = None) -> Dict:
+def fetch_api(endpoint: str, params: Optional[Dict] = None, api_version: str = "v3") -> Dict:
     """
     Make authenticated API call to Readwise with retry on rate limits.
 
     Implements exponential backoff for 429 rate limit errors.
     Retries up to RATE_LIMIT_MAX_RETRIES times.
     Respects Retry-After header if provided by API.
+
+    Args:
+        endpoint: API endpoint (e.g., "/list/" or "/highlights/")
+        params: Query parameters
+        api_version: API version to use ("v2" or "v3", defaults to "v3")
     """
     from requests.exceptions import HTTPError
 
-    base_url = "https://readwise.io/api/v3"
+    base_url = f"https://readwise.io/api/{api_version}"
     url = f"{base_url}{endpoint}"
 
     headers = {
@@ -318,6 +337,159 @@ def save_document(doc: Dict, directory: Path) -> Path:
         counter += 1
 
     markdown = format_document_markdown(doc)
+    with open(filepath, 'w') as f:
+        f.write(markdown)
+
+    return filepath
+
+# ============================================================================
+# HIGHLIGHTS UTILITY FUNCTIONS
+# ============================================================================
+
+def scan_existing_highlights() -> Tuple[set, set]:
+    """Scan Highlights directory to build known IDs and filenames"""
+    known_ids = set()
+    known_filenames = set()
+
+    if not HIGHLIGHTS_DIR.exists():
+        return known_ids, known_filenames
+
+    for filepath in HIGHLIGHTS_DIR.glob("*.md"):
+        # Track filename
+        known_filenames.add(filepath.name)
+
+        # Extract highlight_id from frontmatter if present
+        try:
+            with open(filepath, 'r') as f:
+                content = f.read()
+                # Extract highlight_id from YAML frontmatter
+                match = re.search(r'^highlight_id:\s*"?([^"\n]+)"?', content, re.MULTILINE)
+                if match:
+                    highlight_id = match.group(1)
+                    known_ids.add(highlight_id)
+        except Exception:
+            pass  # Skip files with read errors
+
+    return known_ids, known_filenames
+
+def sanitize_source_title(title: str, max_length: int = 100) -> str:
+    """Sanitize source title for filename (matches document title length)"""
+    # Replace special characters
+    sanitized = title.replace('/', '-').replace(':', ' -')
+    # Remove invalid characters
+    sanitized = re.sub(r'[<>"\\\|?*]', '', sanitized)
+    # Trim to max_length
+    sanitized = sanitized[:max_length].strip()
+    # If empty or no alphanumeric characters, use generic name
+    if not sanitized or not any(c.isalnum() for c in sanitized):
+        sanitized = "Untitled Source"
+    return sanitized
+
+def format_highlight_markdown(highlight: Dict) -> str:
+    """Convert API highlight to markdown with YAML frontmatter"""
+    # Build frontmatter
+    frontmatter = {
+        "highlight_id": str(highlight.get("id", "")),
+        "text": highlight.get("text", "")[:100],  # First 100 chars
+        "source_title": highlight.get("source_title") or highlight.get("book_title"),
+        "source_author": highlight.get("author"),
+        "source_type": highlight.get("category") or highlight.get("source_type"),
+        "source_url": highlight.get("source_url"),
+        "highlighted_at": highlight.get("highlighted_at") or highlight.get("created_at"),
+        "updated_at": highlight.get("updated"),
+        "location": highlight.get("location"),
+        "readwise_url": highlight.get("readwise_url"),
+        "tags": highlight.get("tags", [])
+    }
+
+    # Remove None values
+    frontmatter = {k: v for k, v in frontmatter.items() if v is not None}
+
+    # Build markdown
+    yaml_str = yaml.dump(frontmatter, allow_unicode=True, default_flow_style=False)
+
+    full_text = highlight.get("text", "")
+    note = highlight.get("note", "")
+    source_title = frontmatter.get("source_title", "Unknown Source")
+    author = frontmatter.get("source_author", "")
+    location = frontmatter.get("location", "")
+    highlighted_at = frontmatter.get("highlighted_at", "")
+    source_url = frontmatter.get("source_url", "")
+    readwise_url = frontmatter.get("readwise_url", "")
+
+    # Format highlighted date
+    date_str = ""
+    if highlighted_at:
+        try:
+            dt = datetime.fromisoformat(highlighted_at.replace('Z', '+00:00'))
+            date_str = dt.strftime("%Y-%m-%d")
+        except:
+            date_str = highlighted_at[:10] if len(highlighted_at) >= 10 else highlighted_at
+
+    markdown = f"---\n{yaml_str}---\n\n"
+    markdown += f"# {source_title}\n"
+
+    if author:
+        markdown += f"*{author}*\n\n"
+
+    markdown += "## Highlight\n\n"
+    markdown += f'> "{full_text}"\n\n'
+
+    # Location and date info
+    info_parts = []
+    if location:
+        info_parts.append(f"**Location**: {location}")
+    if date_str:
+        info_parts.append(f"**Highlighted**: {date_str}")
+
+    if info_parts:
+        markdown += " | ".join(info_parts) + "\n\n"
+
+    if note:
+        markdown += f"**Note**: {note}\n\n"
+
+    markdown += "---\n\n"
+
+    if source_url:
+        markdown += f"**Source**: {source_url}\n"
+    if readwise_url:
+        markdown += f"**Readwise**: {readwise_url}\n"
+
+    markdown += f"\n*Imported from Readwise Highlights on {datetime.now(timezone.utc).strftime('%Y-%m-%d')}*\n"
+
+    return markdown
+
+def save_highlight(highlight: Dict, directory: Path) -> Path:
+    """Save highlight with temporal filename: YYYYMMDD-HHMMSS [Source] highlight.md"""
+    directory.mkdir(parents=True, exist_ok=True)
+
+    # Get updated_at timestamp
+    updated_at = highlight.get("updated") or highlight.get("updated_at") or highlight.get("created_at")
+
+    # Parse timestamp and format for filename
+    try:
+        dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+        timestamp_prefix = dt.strftime("%Y%m%d-%H%M%S")
+    except:
+        # Fallback to current time
+        timestamp_prefix = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+    # Get source title
+    source_title = highlight.get("source_title") or highlight.get("book_title") or "Unknown Source"
+    sanitized_source = sanitize_source_title(source_title, max_length=100)
+
+    # Build filename
+    filename = f"{timestamp_prefix} [{sanitized_source}] highlight.md"
+    filepath = directory / filename
+
+    # Handle filename collisions
+    counter = 1
+    while filepath.exists():
+        filename = f"{timestamp_prefix} [{sanitized_source}] highlight ({counter}).md"
+        filepath = directory / filename
+        counter += 1
+
+    markdown = format_highlight_markdown(highlight)
     with open(filepath, 'w') as f:
         f.write(markdown)
 
@@ -709,6 +881,201 @@ async def readwise_reset_state(clear_ranges: bool = False) -> dict:
 
     except Exception as e:
         logger.error(f"Error resetting state: {e}")
+        return {"status": "error", "message": str(e)}
+
+@mcp.tool()
+async def readwise_import_recent_highlights(limit: int = 100) -> dict:
+    """Import recent highlights across all sources since last import"""
+    try:
+        # Load state
+        state = load_state()
+        highlights_state = state.get("highlights", {})
+        last_import = highlights_state.get("last_import_timestamp")
+
+        # Scan existing highlights
+        known_ids, known_filenames = scan_existing_highlights()
+
+        # Build API params
+        params = {"page_size": min(limit, 1000)}
+        if last_import:
+            params["updated__gt"] = last_import
+
+        # Fetch highlights (use v2 API)
+        data = fetch_api("/highlights/", params=params, api_version="v2")
+        results = data.get("results", [])
+
+        imported = 0
+        skipped = 0
+
+        for highlight in results:
+            # Check deduplication
+            highlight_id = str(highlight.get("id", ""))
+
+            # Generate filename for filename-based dedup check
+            updated_at = highlight.get("updated") or highlight.get("updated_at") or highlight.get("created_at")
+            try:
+                dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+                timestamp_prefix = dt.strftime("%Y%m%d-%H%M%S")
+            except:
+                timestamp_prefix = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+            source_title = highlight.get("source_title") or highlight.get("book_title") or "Unknown Source"
+            sanitized_source = sanitize_source_title(source_title, max_length=100)
+            filename = f"{timestamp_prefix} [{sanitized_source}] highlight.md"
+
+            if highlight_id in known_ids or filename in known_filenames:
+                skipped += 1
+                continue
+
+            # Save highlight
+            save_highlight(highlight, HIGHLIGHTS_DIR)
+            imported += 1
+
+            # Track for session deduplication
+            if highlight_id:
+                known_ids.add(highlight_id)
+            known_filenames.add(filename)
+
+        # Update state
+        if results:
+            highlights_state["last_import_timestamp"] = datetime.now(timezone.utc).isoformat()
+            state["highlights"] = highlights_state
+            write_state(state)
+
+        return {
+            "status": "success",
+            "imported": imported,
+            "skipped": skipped,
+            "total_analyzed": len(results)
+        }
+
+    except Exception as e:
+        logger.error(f"Error importing recent highlights: {e}")
+        return {"status": "error", "message": str(e)}
+
+@mcp.tool()
+async def readwise_backfill_highlights(target_date: str) -> dict:
+    """Paginate highlights back to target date with synced range optimization"""
+    try:
+        # Load state
+        state = load_state()
+        highlights_state = state.get("highlights", {})
+        synced_ranges = highlights_state.get("synced_ranges", [])
+
+        # Check optimization
+        should_proceed, optimized_after = optimize_backfill(target_date, synced_ranges)
+
+        if not should_proceed:
+            return {
+                "status": "already_synced",
+                "message": f"Target date {target_date} already synced",
+                "imported": 0,
+                "skipped": 0
+            }
+
+        # Scan existing highlights
+        known_ids, known_filenames = scan_existing_highlights()
+
+        # Build base params (v2 API uses page number, not cursor)
+        base_params = {"page_size": 50}
+        if optimized_after:
+            base_params["updated__gt"] = optimized_after
+
+        # Pagination loop
+        page_num = 1
+        imported = 0
+        skipped = 0
+        target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+        reached_target = False
+
+        while not reached_target and page_num < 1000:  # Safety limit
+            # Build params for this page (create new dict to avoid mutation issues)
+            params = {**base_params, "page": page_num}
+
+            # Fetch page (v2 API)
+            data = fetch_api("/highlights/", params=params, api_version="v2")
+            results = data.get("results", [])
+
+            # Throttle between requests (except first page)
+            if page_num > 1:
+                time.sleep(PAGINATION_THROTTLE_DELAY)
+
+            if not results:
+                break
+
+            # Process highlights
+            for highlight in results:
+                # Get highlight date
+                updated_at = highlight.get("updated") or highlight.get("updated_at") or highlight.get("created_at")
+                try:
+                    highlight_date = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+                except:
+                    # Skip highlights with invalid dates
+                    continue
+
+                # Check if reached target
+                if highlight_date.date() < target_dt.date():
+                    reached_target = True
+                    break
+
+                # Deduplicate
+                highlight_id = str(highlight.get("id", ""))
+
+                # Generate filename for dedup check
+                timestamp_prefix = highlight_date.strftime("%Y%m%d-%H%M%S")
+                source_title = highlight.get("source_title") or highlight.get("book_title") or "Unknown Source"
+                sanitized_source = sanitize_source_title(source_title, max_length=100)
+                filename = f"{timestamp_prefix} [{sanitized_source}] highlight.md"
+
+                if highlight_id in known_ids or filename in known_filenames:
+                    skipped += 1
+                    continue
+
+                # Save highlight
+                save_highlight(highlight, HIGHLIGHTS_DIR)
+                imported += 1
+
+                # Track for session deduplication
+                if highlight_id:
+                    known_ids.add(highlight_id)
+                known_filenames.add(filename)
+
+            if reached_target:
+                break
+
+            # v2 API pagination: check if there are more pages
+            # The API returns "count", "next", "previous" fields
+            if not data.get("next"):
+                break
+
+            page_num += 1
+
+        # Update state with synced range
+        if reached_target:
+            # Create synced range entry
+            synced_range = {
+                "start": f"{target_date}T00:00:00+00:00",
+                "end": datetime.now(timezone.utc).isoformat(),
+                "doc_count": imported,
+                "verified_at": datetime.now(timezone.utc).isoformat()
+            }
+            synced_ranges.append(synced_range)
+
+        highlights_state["last_import_timestamp"] = datetime.now(timezone.utc).isoformat()
+        highlights_state["synced_ranges"] = synced_ranges
+        state["highlights"] = highlights_state
+        write_state(state)
+
+        return {
+            "status": "success" if reached_target else "completed_all_pages",
+            "imported": imported,
+            "skipped": skipped,
+            "pages": page_num,
+            "reached_target": reached_target
+        }
+
+    except Exception as e:
+        logger.error(f"Error in highlights backfill: {e}")
         return {"status": "error", "message": str(e)}
 
 # ============================================================================

@@ -4,11 +4,12 @@ Minimal Python MCP server for Readwise integration - token-efficient, single-fil
 
 ## Features
 
-- **Token-efficient**: 8 essential tools (vs 13+ in Node.js version)
-- **Single-file architecture**: ~350 lines of code
+- **Token-efficient**: 10 essential tools (vs 13+ in Node.js version)
+- **Single-file architecture**: ~1,000 lines of code
 - **Proven logic**: Reuses battle-tested deduplication and pagination from backfill script
 - **State compatibility**: Preserves existing state file format
 - **Smart optimization**: Uses synced ranges to skip unnecessary API calls
+- **Highlights import**: Dedicated tools for importing all highlights with temporal organization
 
 ## Installation
 
@@ -244,6 +245,59 @@ Clear state file (optionally preserve synced_ranges).
 Call readwise_reset_state(clear_ranges=True)
 ```
 
+### 9. `readwise_import_recent_highlights(limit=100)`
+
+Import recent highlights across all sources since last import.
+
+**Parameters**:
+- `limit` (int, optional): Maximum highlights to fetch (default: 100)
+
+**Returns**:
+```json
+{
+  "status": "success",
+  "imported": 42,
+  "skipped": 58,
+  "total_analyzed": 100
+}
+```
+
+**Example**:
+```
+Call readwise_import_recent_highlights(limit=200)
+```
+
+**Saves to**: `2 Resources/Readwise/Highlights/YYYYMMDD-HHMMSS [Source Title] highlight.md`
+
+### 10. `readwise_backfill_highlights(target_date)`
+
+Paginate highlights backwards to target date with synced range optimization.
+
+**Parameters**:
+- `target_date` (string, required): Target date in YYYY-MM-DD format
+
+**Returns**:
+```json
+{
+  "status": "success",
+  "imported": 127,
+  "skipped": 873,
+  "pages": 15,
+  "reached_target": true
+}
+```
+
+**Example**:
+```
+Call readwise_backfill_highlights(target_date="2026-01-01")
+```
+
+**Saves to**: `2 Resources/Readwise/Highlights/YYYYMMDD-HHMMSS [Source Title] highlight.md`
+
+**Filename Format**: Highlights are saved with temporal prefix for chronological sorting:
+- `20260130-143020 [Building a Second Brain] highlight.md`
+- `20260130-142815 [The Phoenix Project] highlight.md`
+
 ## State File Format
 
 The server maintains state at `.claude/state/readwise-import.json`:
@@ -260,9 +314,21 @@ The server maintains state at `.claude/state/readwise-import.json`:
       "verified_at": "2026-01-21T10:43:56.626549Z"
     }
   ],
-  "backfill_in_progress": false
+  "backfill_in_progress": false,
+  "highlights": {
+    "last_import_timestamp": "2026-01-30T05:00:00Z",
+    "synced_ranges": [],
+    "backfill_in_progress": false
+  }
 }
 ```
+
+**Highlights State**: The `highlights` section tracks separate import state for highlights:
+- `last_import_timestamp`: Last highlights import time
+- `synced_ranges`: Optimized ranges for highlights backfill
+- `backfill_in_progress`: Whether a highlights backfill was interrupted
+
+**Backward Compatibility**: Existing state files without the `highlights` section will have it automatically created on first use.
 
 ## Testing
 
@@ -367,12 +433,13 @@ Optimizations for reduced token usage:
 
 | Feature | Python MCP | Node.js MCP |
 |---------|------------|-------------|
-| Lines of code | ~350 | ~6,749 |
-| Tool count | 8 | 13+ |
+| Lines of code | ~1,000 | ~6,749 |
+| Tool count | 10 | 13+ |
 | Dependencies | 4 | 10+ |
 | State compatibility | ✓ | ✓ |
 | Token efficiency | High | Medium |
 | Maintenance | Simple | Complex |
+| Highlights import | ✓ | ✗ |
 
 ## Development
 

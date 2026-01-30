@@ -20,7 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from server import (
     load_state, write_state, optimize_backfill, scan_existing_documents,
     sanitize_filename, extract_id_from_url, format_document_markdown,
-    save_document, fetch_api
+    save_document, fetch_api, scan_existing_highlights, sanitize_source_title,
+    format_highlight_markdown, save_highlight
 )
 
 # ============================================================================
@@ -1000,6 +1001,258 @@ class TestRateLimitHandling:
         # Should fall back to exponential backoff (5s for first retry)
         assert mock_sleep.call_count == 1
         mock_sleep.assert_called_with(5)
+
+
+class TestHighlightsImport:
+    """Test highlights import functionality"""
+
+    def test_scan_existing_highlights(self, tmp_path):
+        """Test scanning highlights directory for known IDs"""
+        # Create test highlight file
+        highlight_content = """---
+highlight_id: "123456789"
+text: "Sample highlight text"
+source_title: "Sample Book"
+---
+
+# Sample Book
+"""
+        highlight_file = tmp_path / "20260130-143020 [Sample Book] highlight.md"
+        with open(highlight_file, 'w') as f:
+            f.write(highlight_content)
+
+        with patch('server.HIGHLIGHTS_DIR', tmp_path):
+            known_ids, known_filenames = scan_existing_highlights()
+            assert "123456789" in known_ids
+            assert "20260130-143020 [Sample Book] highlight.md" in known_filenames
+
+    def test_scan_highlights_empty_directory(self, tmp_path):
+        """Test scanning empty highlights directory"""
+        with patch('server.HIGHLIGHTS_DIR', tmp_path):
+            known_ids, known_filenames = scan_existing_highlights()
+            assert len(known_ids) == 0
+            assert len(known_filenames) == 0
+
+    def test_sanitize_source_title_basic(self):
+        """Test basic source title sanitization"""
+        result = sanitize_source_title("Building a Second Brain")
+        assert result == "Building a Second Brain"
+
+    def test_sanitize_source_title_special_chars(self):
+        """Test sanitization with special characters"""
+        result = sanitize_source_title("Title: With / Special <Chars>")
+        assert "/" not in result
+        assert ":" not in result
+        assert "<" not in result
+        assert ">" not in result
+
+    def test_sanitize_source_title_long(self):
+        """Test truncation of long source titles"""
+        long_title = "A" * 150
+        result = sanitize_source_title(long_title, max_length=100)
+        assert len(result) == 100
+
+    def test_sanitize_source_title_empty(self):
+        """Test empty source title uses fallback"""
+        result = sanitize_source_title("")
+        assert result == "Untitled Source"
+
+    def test_sanitize_source_title_special_only(self):
+        """Test source title with only special characters"""
+        result = sanitize_source_title("...")
+        assert result == "Untitled Source"
+
+    def test_format_highlight_markdown(self):
+        """Test highlight markdown generation with all fields"""
+        highlight = {
+            "id": 123456789,
+            "text": "This is a sample highlight that demonstrates the format.",
+            "note": "My personal note about this highlight",
+            "source_title": "Building a Second Brain",
+            "author": "Tiago Forte",
+            "category": "book",
+            "source_url": "https://example.com/book",
+            "highlighted_at": "2024-05-26T10:30:00Z",
+            "updated": "2024-05-26T10:30:00Z",
+            "location": "2149",
+            "readwise_url": "https://readwise.io/open/123456789",
+            "tags": ["productivity", "knowledge-management"]
+        }
+
+        markdown = format_highlight_markdown(highlight)
+
+        # Check frontmatter
+        assert "---" in markdown
+        assert "highlight_id: '123456789'" in markdown
+        assert "source_title: Building a Second Brain" in markdown
+        assert "source_author: Tiago Forte" in markdown
+
+        # Check body
+        assert "# Building a Second Brain" in markdown
+        assert "*Tiago Forte*" in markdown
+        assert '> "This is a sample highlight that demonstrates the format."' in markdown
+        assert "**Location**: 2149" in markdown
+        assert "**Note**: My personal note about this highlight" in markdown
+        assert "**Source**: https://example.com/book" in markdown
+        assert "**Readwise**: https://readwise.io/open/123456789" in markdown
+
+    def test_save_highlight(self, tmp_path):
+        """Test saving highlight to filesystem"""
+        highlight = {
+            "id": 123456789,
+            "text": "Sample highlight text",
+            "source_title": "Building a Second Brain",
+            "author": "Tiago Forte",
+            "updated": "2026-01-30T14:30:20Z"
+        }
+
+        filepath = save_highlight(highlight, tmp_path)
+        assert filepath.exists()
+        assert filepath.name.startswith("20260130-143020")
+        assert "[Building a Second Brain]" in filepath.name
+        assert filepath.name.endswith("highlight.md")
+
+        # Verify content
+        with open(filepath, 'r') as f:
+            content = f.read()
+            assert "Building a Second Brain" in content
+            assert "Sample highlight text" in content
+
+    def test_save_highlight_collision(self, tmp_path):
+        """Test handling filename collisions for highlights"""
+        highlight = {
+            "id": 123456789,
+            "text": "First highlight",
+            "source_title": "Same Book",
+            "updated": "2026-01-30T14:30:20Z"
+        }
+
+        # Save first highlight
+        filepath1 = save_highlight(highlight, tmp_path)
+        assert "[Same Book]" in filepath1.name
+
+        # Save second highlight with same timestamp and source
+        highlight2 = {
+            "id": 987654321,
+            "text": "Second highlight",
+            "source_title": "Same Book",
+            "updated": "2026-01-30T14:30:20Z"
+        }
+        filepath2 = save_highlight(highlight2, tmp_path)
+
+        # Should have collision suffix
+        assert filepath1 != filepath2
+        assert "(1)" in filepath2.name
+
+    def test_highlights_deduplication(self, tmp_path):
+        """Test ID-based and filename-based deduplication"""
+        # Create existing highlight
+        existing_highlight = tmp_path / "20260130-143020 [Test Book] highlight.md"
+        with open(existing_highlight, 'w') as f:
+            f.write('---\nhighlight_id: "existing123"\n---\n')
+
+        with patch('server.HIGHLIGHTS_DIR', tmp_path):
+            known_ids, known_filenames = scan_existing_highlights()
+
+            # Should find the ID
+            assert "existing123" in known_ids
+            # Should find the filename
+            assert "20260130-143020 [Test Book] highlight.md" in known_filenames
+
+    def test_highlights_state_management(self, tmp_path):
+        """Test separate highlights state tracking"""
+        state_file = tmp_path / "state.json"
+
+        # Create state without highlights section
+        old_state = {
+            "last_import_timestamp": "2026-01-22T00:00:00Z",
+            "synced_ranges": []
+        }
+        with open(state_file, 'w') as f:
+            json.dump(old_state, f)
+
+        # Load state should add highlights section
+        with patch('server.STATE_FILE', state_file):
+            state = load_state()
+            assert "highlights" in state
+            assert "last_import_timestamp" in state["highlights"]
+            assert "synced_ranges" in state["highlights"]
+
+    def test_highlights_filename_generation(self):
+        """Test temporal + source title filename format"""
+        highlight = {
+            "id": 123,
+            "text": "Test",
+            "source_title": "The Phoenix Project",
+            "updated": "2026-01-30T14:28:15Z"
+        }
+
+        # Should generate format: YYYYMMDD-HHMMSS [Source] highlight.md
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = save_highlight(highlight, Path(tmpdir))
+            expected_prefix = "20260130-142815"
+            assert filepath.name.startswith(expected_prefix)
+            assert "[The Phoenix Project]" in filepath.name
+            assert filepath.name.endswith("highlight.md")
+
+    @pytest.mark.asyncio
+    @patch('server.fetch_api')
+    @patch('server.save_highlight')
+    async def test_highlights_backfill_pagination(self, mock_save, mock_fetch):
+        """Test page-number based pagination (not cursor)"""
+        from server import readwise_backfill_highlights
+
+        # Mock two pages of results (v2 API format)
+        page1_response = {
+            "count": 100,
+            "next": "https://readwise.io/api/v2/highlights/?page=2",
+            "previous": None,
+            "results": [
+                {
+                    "id": 1,
+                    "text": "Highlight 1",
+                    "source_title": "Book 1",
+                    "updated": "2026-01-15T00:00:00Z"
+                }
+            ]
+        }
+
+        page2_response = {
+            "count": 100,
+            "next": None,
+            "previous": "https://readwise.io/api/v2/highlights/?page=1",
+            "results": [
+                {
+                    "id": 2,
+                    "text": "Highlight 2",
+                    "source_title": "Book 2",
+                    "updated": "2026-01-10T00:00:00Z"
+                }
+            ]
+        }
+
+        mock_fetch.side_effect = [page1_response, page2_response]
+
+        # Mock other dependencies
+        with patch('server.scan_existing_highlights', return_value=(set(), set())), \
+             patch('server.load_state', return_value={"highlights": {"synced_ranges": []}}), \
+             patch('server.write_state'):
+
+            result = await readwise_backfill_highlights("2026-01-05")
+
+            # Should fetch 2 pages
+            assert mock_fetch.call_count == 2
+
+            # Verify page parameter was used (not cursor)
+            first_call_params = mock_fetch.call_args_list[0][1]['params']
+            assert 'page' in first_call_params
+            assert first_call_params['page'] == 1
+
+            second_call_params = mock_fetch.call_args_list[1][1]['params']
+            assert second_call_params['page'] == 2
+
+            # Should have saved 2 highlights
+            assert mock_save.call_count == 2
 
 
 # ============================================================================
