@@ -1199,34 +1199,46 @@ source_title: "Sample Book"
     @patch('server.fetch_api')
     @patch('server.save_highlight')
     async def test_highlights_backfill_pagination(self, mock_save, mock_fetch):
-        """Test page-number based pagination (not cursor)"""
+        """Test cursor-based pagination via v2 export API"""
         from server import readwise_backfill_highlights
 
-        # Mock two pages of results (v2 API format)
+        # Mock two pages of results (v2 export API format: books with nested highlights)
         page1_response = {
-            "count": 100,
-            "next": "https://readwise.io/api/v2/highlights/?page=2",
-            "previous": None,
+            "count": 2,
+            "nextPageCursor": "cursor_abc123",
             "results": [
                 {
-                    "id": 1,
-                    "text": "Highlight 1",
-                    "source_title": "Book 1",
-                    "updated": "2026-01-15T00:00:00Z"
+                    "title": "Book 1",
+                    "author": "Author 1",
+                    "category": "book",
+                    "source_url": "https://example.com/1",
+                    "highlights": [
+                        {
+                            "id": 1,
+                            "text": "Highlight 1",
+                            "updated": "2026-01-15T00:00:00Z"
+                        }
+                    ]
                 }
             ]
         }
 
         page2_response = {
-            "count": 100,
-            "next": None,
-            "previous": "https://readwise.io/api/v2/highlights/?page=1",
+            "count": 2,
+            "nextPageCursor": None,
             "results": [
                 {
-                    "id": 2,
-                    "text": "Highlight 2",
-                    "source_title": "Book 2",
-                    "updated": "2026-01-10T00:00:00Z"
+                    "title": "Book 2",
+                    "author": "Author 2",
+                    "category": "book",
+                    "source_url": "https://example.com/2",
+                    "highlights": [
+                        {
+                            "id": 2,
+                            "text": "Highlight 2",
+                            "updated": "2026-01-10T00:00:00Z"
+                        }
+                    ]
                 }
             ]
         }
@@ -1236,23 +1248,258 @@ source_title: "Sample Book"
         # Mock other dependencies
         with patch('server.scan_existing_highlights', return_value=(set(), set())), \
              patch('server.load_state', return_value={"highlights": {"synced_ranges": []}}), \
-             patch('server.write_state'):
+             patch('server.write_state'), \
+             patch('server.time.sleep'):
 
             result = await readwise_backfill_highlights("2026-01-05")
 
             # Should fetch 2 pages
             assert mock_fetch.call_count == 2
 
-            # Verify page parameter was used (not cursor)
+            # Verify cursor-based pagination was used
             first_call_params = mock_fetch.call_args_list[0][1]['params']
-            assert 'page' in first_call_params
-            assert first_call_params['page'] == 1
+            assert 'pageCursor' not in first_call_params  # No cursor on first page
 
             second_call_params = mock_fetch.call_args_list[1][1]['params']
-            assert second_call_params['page'] == 2
+            assert second_call_params['pageCursor'] == "cursor_abc123"
 
             # Should have saved 2 highlights
             assert mock_save.call_count == 2
+
+
+class TestHighlightsDeduplication:
+    """Regression tests for highlight deduplication logic.
+
+    These tests verify the fix for the bug where highlights sharing the same
+    timestamp (common in batch imports) were falsely classified as duplicates
+    because the dedup logic checked filename collisions using the base filename
+    instead of the actual saved filename (which includes collision counters).
+    """
+
+    @pytest.mark.asyncio
+    async def test_same_timestamp_highlights_all_imported(self, tmp_path):
+        """Multiple highlights with same timestamp but different IDs are all imported"""
+        from server import readwise_import_recent_highlights
+
+        # 3 highlights from the same book, same updated timestamp, different IDs
+        api_response = {
+            "results": [
+                {
+                    "title": "Same Book",
+                    "author": "Author A",
+                    "category": "book",
+                    "source_url": "https://example.com/book",
+                    "highlights": [
+                        {
+                            "id": 1001,
+                            "text": "First highlight text",
+                            "updated": "2026-01-15T10:00:00Z",
+                        },
+                        {
+                            "id": 1002,
+                            "text": "Second highlight text",
+                            "updated": "2026-01-15T10:00:00Z",
+                        },
+                        {
+                            "id": 1003,
+                            "text": "Third highlight text",
+                            "updated": "2026-01-15T10:00:00Z",
+                        },
+                    ]
+                }
+            ]
+        }
+
+        with patch('server.fetch_api', return_value=api_response), \
+             patch('server.scan_existing_highlights', return_value=(set(), set())), \
+             patch('server.HIGHLIGHTS_DIR', tmp_path), \
+             patch('server.load_state', return_value={"highlights": {"last_import_timestamp": None}}), \
+             patch('server.write_state'):
+
+            result = await readwise_import_recent_highlights(limit=100)
+
+        assert result["imported"] == 3
+        assert result["skipped"] == 0
+
+        # Verify 3 files exist with collision suffixes
+        files = sorted(tmp_path.glob("*.md"))
+        assert len(files) == 3
+        names = {f.name for f in files}
+        assert "20260115-100000 [Same Book] highlight.md" in names
+        assert "20260115-100000 [Same Book] highlight (1).md" in names
+        assert "20260115-100000 [Same Book] highlight (2).md" in names
+
+    @pytest.mark.asyncio
+    async def test_duplicate_highlight_ids_skipped(self, tmp_path):
+        """Highlights with IDs already on disk are correctly skipped"""
+        from server import readwise_import_recent_highlights
+
+        # Pre-create a highlight file with highlight_id "123" in frontmatter
+        existing = tmp_path / "20260115-100000 [Some Book] highlight.md"
+        existing.write_text('---\nhighlight_id: "123"\n---\nExisting content\n')
+
+        api_response = {
+            "results": [
+                {
+                    "title": "Some Book",
+                    "author": "Author B",
+                    "category": "book",
+                    "source_url": "https://example.com",
+                    "highlights": [
+                        {
+                            "id": 123,
+                            "text": "Duplicate highlight",
+                            "updated": "2026-01-15T10:00:00Z",
+                        }
+                    ]
+                }
+            ]
+        }
+
+        with patch('server.fetch_api', return_value=api_response), \
+             patch('server.HIGHLIGHTS_DIR', tmp_path), \
+             patch('server.load_state', return_value={"highlights": {"last_import_timestamp": None}}), \
+             patch('server.write_state'):
+
+            result = await readwise_import_recent_highlights(limit=100)
+
+        assert result["imported"] == 0
+        assert result["skipped"] == 1
+
+    @pytest.mark.asyncio
+    async def test_no_id_highlights_filename_dedup(self, tmp_path):
+        """Highlights without IDs fall back to filename-based deduplication"""
+        from server import readwise_import_recent_highlights
+
+        # Pre-create a file that matches the expected filename
+        existing = tmp_path / "20260115-100000 [Mystery Book] highlight.md"
+        existing.write_text('---\nhighlight_id: ""\n---\nExisting\n')
+
+        api_response = {
+            "results": [
+                {
+                    "title": "Mystery Book",
+                    "author": "Author C",
+                    "category": "book",
+                    "source_url": "https://example.com",
+                    "highlights": [
+                        {
+                            "id": "",
+                            "text": "No-ID highlight",
+                            "updated": "2026-01-15T10:00:00Z",
+                        }
+                    ]
+                }
+            ]
+        }
+
+        with patch('server.fetch_api', return_value=api_response), \
+             patch('server.HIGHLIGHTS_DIR', tmp_path), \
+             patch('server.load_state', return_value={"highlights": {"last_import_timestamp": None}}), \
+             patch('server.write_state'):
+
+            result = await readwise_import_recent_highlights(limit=100)
+
+        assert result["imported"] == 0
+        assert result["skipped"] == 1
+
+    @pytest.mark.asyncio
+    async def test_known_filenames_track_actual_saved_path(self, tmp_path):
+        """known_filenames tracks actual saved filenames including collision counters"""
+        from server import readwise_import_recent_highlights
+
+        # 2 highlights with same timestamp/source but different IDs
+        api_response = {
+            "results": [
+                {
+                    "title": "Collision Book",
+                    "author": "Author D",
+                    "category": "book",
+                    "source_url": "https://example.com",
+                    "highlights": [
+                        {
+                            "id": 2001,
+                            "text": "First",
+                            "updated": "2026-01-20T12:00:00Z",
+                        },
+                        {
+                            "id": 2002,
+                            "text": "Second",
+                            "updated": "2026-01-20T12:00:00Z",
+                        },
+                    ]
+                }
+            ]
+        }
+
+        with patch('server.fetch_api', return_value=api_response), \
+             patch('server.scan_existing_highlights', return_value=(set(), set())), \
+             patch('server.HIGHLIGHTS_DIR', tmp_path), \
+             patch('server.load_state', return_value={"highlights": {"last_import_timestamp": None}}), \
+             patch('server.write_state'):
+
+            result = await readwise_import_recent_highlights(limit=100)
+
+        assert result["imported"] == 2
+        assert result["skipped"] == 0
+
+        # Verify the actual filenames on disk
+        files = sorted(tmp_path.glob("*.md"))
+        assert len(files) == 2
+        names = {f.name for f in files}
+        assert "20260120-120000 [Collision Book] highlight.md" in names
+        assert "20260120-120000 [Collision Book] highlight (1).md" in names
+
+    @pytest.mark.asyncio
+    async def test_backfill_same_timestamp_highlights_all_imported(self, tmp_path):
+        """Backfill: multiple highlights with same timestamp but different IDs are all imported"""
+        from server import readwise_backfill_highlights
+
+        # Backfill uses /export/ API which returns books with nested highlights
+        page_response = {
+            "count": 1,
+            "nextPageCursor": None,
+            "results": [
+                {
+                    "title": "Backfill Book",
+                    "author": "Author E",
+                    "category": "book",
+                    "source_url": "https://example.com",
+                    "highlights": [
+                        {
+                            "id": 3001,
+                            "text": "Backfill highlight 1",
+                            "updated": "2026-01-10T08:00:00Z",
+                        },
+                        {
+                            "id": 3002,
+                            "text": "Backfill highlight 2",
+                            "updated": "2026-01-10T08:00:00Z",
+                        },
+                        {
+                            "id": 3003,
+                            "text": "Backfill highlight 3",
+                            "updated": "2026-01-10T08:00:00Z",
+                        },
+                    ]
+                }
+            ]
+        }
+
+        with patch('server.fetch_api', return_value=page_response), \
+             patch('server.scan_existing_highlights', return_value=(set(), set())), \
+             patch('server.HIGHLIGHTS_DIR', tmp_path), \
+             patch('server.load_state', return_value={"highlights": {"synced_ranges": []}}), \
+             patch('server.write_state'), \
+             patch('server.time.sleep'):
+
+            result = await readwise_backfill_highlights("2026-01-01")
+
+        assert result["imported"] == 3
+        assert result["skipped"] == 0
+
+        files = sorted(tmp_path.glob("*.md"))
+        assert len(files) == 3
 
 
 # ============================================================================

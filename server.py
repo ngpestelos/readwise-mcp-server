@@ -942,18 +942,21 @@ async def readwise_import_recent_highlights(limit: int = 100) -> dict:
                 sanitized_source = sanitize_source_title(book_title, max_length=100)
                 filename = f"{timestamp_prefix} [{sanitized_source}] highlight.md"
 
-                if highlight_id in known_ids or filename in known_filenames:
+                if highlight_id and highlight_id in known_ids:
+                    skipped += 1
+                    continue
+                if not highlight_id and filename in known_filenames:
                     skipped += 1
                     continue
 
                 # Save highlight
-                save_highlight(highlight, HIGHLIGHTS_DIR)
+                filepath = save_highlight(highlight, HIGHLIGHTS_DIR)
                 imported += 1
 
                 # Track for session deduplication
                 if highlight_id:
                     known_ids.add(highlight_id)
-                known_filenames.add(filename)
+                known_filenames.add(filepath.name)
 
         # Update state
         if total_analyzed > 0:
@@ -995,25 +998,34 @@ async def readwise_backfill_highlights(target_date: str) -> dict:
         # Scan existing highlights
         known_ids, known_filenames = scan_existing_highlights()
 
-        # Build base params (v2 export API uses page number)
-        base_params = {"page_size": 50}
+        # Build base params (v2 export API uses cursor-based pagination)
+        # Use maximum page_size (1000) to minimize pagination requests
+        base_params = {"page_size": 1000}
         if optimized_after:
             base_params["updatedAfter"] = optimized_after
 
-        # Pagination loop
-        page_num = 1
+        # Pagination loop with cursor-based pagination
+        cursor = None
+        page_num = 0  # For progress reporting only
         imported = 0
         skipped = 0
         target_dt = datetime.strptime(target_date, "%Y-%m-%d")
         reached_target = False
 
         while not reached_target and page_num < 1000:  # Safety limit
+            page_num += 1
+
             # Build params for this page
-            params = {**base_params, "page": page_num}
+            params = base_params.copy()
+            if cursor:
+                params["pageCursor"] = cursor
 
             # Fetch page using export API (includes book metadata)
             data = fetch_api("/export/", params=params, api_version="v2")
             books = data.get("results", [])
+
+            # Debug: log pagination info
+            logger.info(f"Page {page_num}: {len(books)} books, cursor={cursor}, nextCursor={data.get('nextPageCursor')}")
 
             # Throttle between requests (except first page)
             if page_num > 1:
@@ -1064,28 +1076,33 @@ async def readwise_backfill_highlights(target_date: str) -> dict:
                     sanitized_source = sanitize_source_title(book_title, max_length=100)
                     filename = f"{timestamp_prefix} [{sanitized_source}] highlight.md"
 
-                    if highlight_id in known_ids or filename in known_filenames:
+                    if highlight_id and highlight_id in known_ids:
+                        skipped += 1
+                        continue
+                    if not highlight_id and filename in known_filenames:
                         skipped += 1
                         continue
 
                     # Save highlight
-                    save_highlight(highlight, HIGHLIGHTS_DIR)
+                    filepath = save_highlight(highlight, HIGHLIGHTS_DIR)
                     imported += 1
 
                     # Track for session deduplication
                     if highlight_id:
                         known_ids.add(highlight_id)
-                    known_filenames.add(filename)
+                    known_filenames.add(filepath.name)
 
             if reached_target:
                 break
 
-            # v2 API pagination: check if there are more pages
-            # The API returns "count", "next", "previous" fields
-            if not data.get("next"):
+            # v2 API cursor-based pagination: check if there are more pages
+            # The API returns "count", "nextPageCursor", "results" fields
+            next_cursor = data.get("nextPageCursor")
+            if not next_cursor:
+                logger.info(f"No more pages - nextPageCursor is {next_cursor}")
                 break
 
-            page_num += 1
+            cursor = next_cursor
 
         # Update state with synced range
         if reached_target:
