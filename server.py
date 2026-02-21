@@ -513,9 +513,17 @@ async def readwise_daily_review() -> dict:
         today = datetime.now(timezone.utc).date()
         today_str = today.isoformat()
 
-        # Fetch highlights API (using highlights endpoint for daily review)
-        data = fetch_api("/highlights/", params={"limit": 50})
-        highlights = data.get("results", [])
+        # Fetch highlights via v2 export endpoint (v3 has no highlights endpoint)
+        data = fetch_api("/export/", params={"page_size": 50}, api_version="v2")
+        books = data.get("results", [])
+
+        # Flatten highlights from nested book structure
+        highlights = []
+        for book in books:
+            for h in book.get("highlights", []):
+                h["source_url"] = book.get("source_url", "Unknown")
+                h["book_title"] = book.get("title", "Unknown")
+                highlights.append(h)
 
         if not highlights:
             return {"status": "no_highlights", "count": 0}
@@ -531,7 +539,7 @@ async def readwise_daily_review() -> dict:
             content += f"## {highlight.get('text', '')}\n\n"
             if highlight.get('note'):
                 content += f"**Note**: {highlight['note']}\n\n"
-            content += f"**Source**: {highlight.get('source_url', 'Unknown')}\n\n---\n\n"
+            content += f"**Source**: {highlight.get('book_title', 'Unknown')} ({highlight.get('source_url', 'Unknown')})\n\n---\n\n"
 
         with open(filepath, 'w') as f:
             f.write(content)
@@ -710,31 +718,33 @@ async def readwise_backfill(target_date: str, category: str = "tweet") -> dict:
 async def readwise_book_highlights(title: Optional[str] = None, book_id: Optional[str] = None) -> dict:
     """Get highlights for a specific book"""
     try:
-        # Build params
-        params = {}
+        # Build params for v2 export endpoint (v3 has no highlights endpoint)
+        params = {"page_size": 1000}
         if book_id:
-            params["book_id"] = book_id
+            params["ids"] = book_id
 
-        # Fetch highlights
-        data = fetch_api("/highlights/", params=params)
-        highlights = data.get("results", [])
+        data = fetch_api("/export/", params=params, api_version="v2")
+        books = data.get("results", [])
 
-        # Filter by title if provided
-        if title:
-            highlights = [h for h in highlights if title.lower() in h.get("book_title", "").lower()]
+        # Flatten highlights from nested book structure
+        all_highlights = []
+        for book in books:
+            book_title = book.get("title", "")
+            if title and title.lower() not in book_title.lower():
+                continue
+            for h in book.get("highlights", []):
+                all_highlights.append({
+                    "text": h.get("text"),
+                    "note": h.get("note"),
+                    "book_title": book_title,
+                    "location": h.get("location"),
+                    "highlighted_at": h.get("highlighted_at")
+                })
 
         return {
             "status": "success",
-            "count": len(highlights),
-            "highlights": [
-                {
-                    "text": h.get("text"),
-                    "note": h.get("note"),
-                    "book_title": h.get("book_title"),
-                    "location": h.get("location")
-                }
-                for h in highlights[:50]  # Limit to 50 for token efficiency
-            ]
+            "count": len(all_highlights),
+            "highlights": all_highlights[:50]  # Limit to 50 for token efficiency
         }
 
     except Exception as e:
@@ -745,30 +755,37 @@ async def readwise_book_highlights(title: Optional[str] = None, book_id: Optiona
 async def readwise_search_highlights(query: str, limit: int = 50) -> dict:
     """Search highlights by text query"""
     try:
-        # Fetch highlights (API doesn't support search directly, so we fetch and filter)
-        data = fetch_api("/highlights/", params={"limit": 100})
-        highlights = data.get("results", [])
+        # Fetch via v2 export endpoint (v3 has no highlights endpoint)
+        data = fetch_api("/export/", params={"page_size": 1000}, api_version="v2")
+        books = data.get("results", [])
 
-        # Filter by query
+        # Flatten and filter highlights by query across text, note, title, author
         query_lower = query.lower()
-        matching = [
-            h for h in highlights
-            if query_lower in h.get("text", "").lower() or
-               query_lower in h.get("note", "").lower()
-        ]
+        matching = []
+        for book in books:
+            book_title = book.get("title", "")
+            book_author = book.get("author", "")
+            for h in book.get("highlights", []):
+                text = h.get("text", "")
+                note = h.get("note", "")
+                if (query_lower in text.lower() or
+                    query_lower in note.lower() or
+                    query_lower in book_title.lower() or
+                    query_lower in book_author.lower()):
+                    matching.append({
+                        "text": text,
+                        "note": note,
+                        "book_title": book_title,
+                        "author": book_author,
+                        "source_url": book.get("source_url"),
+                        "highlighted_at": h.get("highlighted_at"),
+                        "location": h.get("location")
+                    })
 
         return {
             "status": "success",
             "count": len(matching),
-            "highlights": [
-                {
-                    "text": h.get("text"),
-                    "note": h.get("note"),
-                    "source": h.get("source_url"),
-                    "created_at": h.get("created_at")
-                }
-                for h in matching[:limit]
-            ]
+            "highlights": matching[:limit]
         }
 
     except Exception as e:
