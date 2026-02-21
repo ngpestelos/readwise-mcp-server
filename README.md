@@ -352,6 +352,8 @@ pytest test_server.py -v
 - API calls with mocked responses
 - Markdown formatting
 - Document saving with collision handling
+- Highlights query tools (daily_review, book_highlights, search_highlights)
+- Highlights import and backfill with deduplication
 
 ## Troubleshooting
 

@@ -1267,6 +1267,238 @@ source_title: "Sample Book"
             assert mock_save.call_count == 2
 
 
+class TestHighlightsQueryTools:
+    """Test the three highlights query tools that use v2 /export/ endpoint.
+
+    These tools (daily_review, book_highlights, search_highlights) were fixed
+    to use the v2 /export/ endpoint instead of the nonexistent v3 /highlights/.
+    The v2 export returns books with nested highlights, so these tools must
+    flatten that structure before returning results.
+    """
+
+    @pytest.mark.asyncio
+    @patch('server.fetch_api')
+    async def test_daily_review_uses_v2_export(self, mock_fetch, tmp_path):
+        """daily_review calls /export/ with api_version='v2'"""
+        from server import readwise_daily_review
+
+        mock_fetch.return_value = {
+            "results": [
+                {
+                    "title": "Test Book",
+                    "source_url": "https://example.com/book",
+                    "highlights": [
+                        {"text": "Highlight one", "note": "A note", "highlighted_at": "2026-02-22T00:00:00Z"},
+                        {"text": "Highlight two", "note": "", "highlighted_at": "2026-02-22T01:00:00Z"},
+                    ]
+                }
+            ]
+        }
+
+        with patch('server.DAILY_REVIEWS_DIR', tmp_path):
+            result = await readwise_daily_review()
+
+        assert result["status"] == "success"
+        assert result["count"] == 2
+
+        # Verify v2 export endpoint was called
+        mock_fetch.assert_called_once_with("/export/", params={"page_size": 50}, api_version="v2")
+
+        # Verify file was written with flattened highlights
+        written_file = Path(result["file"])
+        assert written_file.exists()
+        content = written_file.read_text()
+        assert "Highlight one" in content
+        assert "Highlight two" in content
+        assert "Test Book" in content
+
+    @pytest.mark.asyncio
+    @patch('server.fetch_api')
+    async def test_daily_review_no_highlights(self, mock_fetch, tmp_path):
+        """daily_review returns no_highlights when export has no results"""
+        from server import readwise_daily_review
+
+        mock_fetch.return_value = {"results": []}
+
+        with patch('server.DAILY_REVIEWS_DIR', tmp_path):
+            result = await readwise_daily_review()
+
+        assert result["status"] == "no_highlights"
+        assert result["count"] == 0
+
+    @pytest.mark.asyncio
+    @patch('server.fetch_api')
+    async def test_book_highlights_uses_v2_export(self, mock_fetch):
+        """book_highlights calls /export/ with api_version='v2'"""
+        from server import readwise_book_highlights
+
+        mock_fetch.return_value = {
+            "results": [
+                {
+                    "title": "Atomic Habits",
+                    "highlights": [
+                        {"text": "Habits are the compound interest of self-improvement", "note": "", "location": "42", "highlighted_at": "2026-01-15T00:00:00Z"},
+                    ]
+                },
+                {
+                    "title": "Other Book",
+                    "highlights": [
+                        {"text": "Irrelevant highlight", "note": "", "location": "1", "highlighted_at": "2026-01-10T00:00:00Z"},
+                    ]
+                }
+            ]
+        }
+
+        result = await readwise_book_highlights(title="Atomic")
+
+        assert result["status"] == "success"
+        assert result["count"] == 1
+        assert result["highlights"][0]["book_title"] == "Atomic Habits"
+        assert result["highlights"][0]["text"] == "Habits are the compound interest of self-improvement"
+
+        # Verify v2 export endpoint
+        mock_fetch.assert_called_once_with("/export/", params={"page_size": 1000}, api_version="v2")
+
+    @pytest.mark.asyncio
+    @patch('server.fetch_api')
+    async def test_book_highlights_by_id(self, mock_fetch):
+        """book_highlights passes book_id as 'ids' parameter"""
+        from server import readwise_book_highlights
+
+        mock_fetch.return_value = {
+            "results": [
+                {
+                    "title": "Specific Book",
+                    "highlights": [
+                        {"text": "A highlight", "note": "", "location": "10", "highlighted_at": "2026-01-20T00:00:00Z"},
+                    ]
+                }
+            ]
+        }
+
+        result = await readwise_book_highlights(book_id="12345")
+
+        assert result["status"] == "success"
+        assert result["count"] == 1
+
+        # Verify ids parameter was used
+        mock_fetch.assert_called_once_with("/export/", params={"page_size": 1000, "ids": "12345"}, api_version="v2")
+
+    @pytest.mark.asyncio
+    @patch('server.fetch_api')
+    async def test_search_highlights_uses_v2_export(self, mock_fetch):
+        """search_highlights calls /export/ with api_version='v2' and filters results"""
+        from server import readwise_search_highlights
+
+        mock_fetch.return_value = {
+            "results": [
+                {
+                    "title": "Tweets From Thariq",
+                    "author": "Thariq",
+                    "source_url": "https://twitter.com/thariq",
+                    "highlights": [
+                        {"text": "AI will transform education", "note": "", "highlighted_at": "2026-02-01T00:00:00Z", "location": "1"},
+                        {"text": "Unrelated highlight about cooking", "note": "", "highlighted_at": "2026-02-01T01:00:00Z", "location": "2"},
+                    ]
+                },
+                {
+                    "title": "Other Source",
+                    "author": "Someone Else",
+                    "source_url": "https://example.com",
+                    "highlights": [
+                        {"text": "Nothing relevant here", "note": "", "highlighted_at": "2026-01-15T00:00:00Z", "location": "5"},
+                    ]
+                }
+            ]
+        }
+
+        result = await readwise_search_highlights(query="Thariq")
+
+        assert result["status"] == "success"
+        # Should match both highlights from "Tweets From Thariq" (title match) but not the other book
+        assert result["count"] == 2
+        assert all(h["book_title"] == "Tweets From Thariq" for h in result["highlights"])
+
+        # Verify v2 export endpoint
+        mock_fetch.assert_called_once_with("/export/", params={"page_size": 1000}, api_version="v2")
+
+    @pytest.mark.asyncio
+    @patch('server.fetch_api')
+    async def test_search_highlights_matches_text(self, mock_fetch):
+        """search_highlights matches against highlight text"""
+        from server import readwise_search_highlights
+
+        mock_fetch.return_value = {
+            "results": [
+                {
+                    "title": "Random Book",
+                    "author": "Author",
+                    "source_url": "https://example.com",
+                    "highlights": [
+                        {"text": "Productivity is about systems not goals", "note": "", "highlighted_at": "2026-01-01T00:00:00Z", "location": "1"},
+                        {"text": "Sleep is important", "note": "", "highlighted_at": "2026-01-01T01:00:00Z", "location": "2"},
+                    ]
+                }
+            ]
+        }
+
+        result = await readwise_search_highlights(query="productivity")
+
+        assert result["count"] == 1
+        assert "systems not goals" in result["highlights"][0]["text"]
+
+    @pytest.mark.asyncio
+    @patch('server.fetch_api')
+    async def test_search_highlights_matches_note(self, mock_fetch):
+        """search_highlights matches against highlight notes"""
+        from server import readwise_search_highlights
+
+        mock_fetch.return_value = {
+            "results": [
+                {
+                    "title": "A Book",
+                    "author": "Author",
+                    "source_url": "https://example.com",
+                    "highlights": [
+                        {"text": "Some text", "note": "This relates to PARA method", "highlighted_at": "2026-01-01T00:00:00Z", "location": "1"},
+                    ]
+                }
+            ]
+        }
+
+        result = await readwise_search_highlights(query="PARA")
+
+        assert result["count"] == 1
+        assert result["highlights"][0]["note"] == "This relates to PARA method"
+
+    @pytest.mark.asyncio
+    @patch('server.fetch_api')
+    async def test_search_highlights_respects_limit(self, mock_fetch):
+        """search_highlights truncates results to limit"""
+        from server import readwise_search_highlights
+
+        # Return many matching highlights
+        highlights = [
+            {"text": f"Match {i}", "note": "", "highlighted_at": "2026-01-01T00:00:00Z", "location": str(i)}
+            for i in range(20)
+        ]
+        mock_fetch.return_value = {
+            "results": [
+                {
+                    "title": "Match Book",
+                    "author": "Author",
+                    "source_url": "https://example.com",
+                    "highlights": highlights
+                }
+            ]
+        }
+
+        result = await readwise_search_highlights(query="Match", limit=5)
+
+        assert result["count"] == 20  # Total matches
+        assert len(result["highlights"]) == 5  # Truncated to limit
+
+
 class TestHighlightsDeduplication:
     """Regression tests for highlight deduplication logic.
 
