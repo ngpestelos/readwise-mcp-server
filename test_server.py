@@ -122,6 +122,29 @@ class TestStateManagement:
             assert "synced_ranges" in state
             assert state["synced_ranges"] == []
 
+    def test_load_state_corrupt_falls_back_to_default(self, tmp_path):
+        """Corrupt (non-JSON) state file should fall back to default, not raise"""
+        state_file = tmp_path / "state.json"
+        # Simulate an interrupted/partial write from non-atomic write_state
+        state_file.write_text("{bad json, not parseable")
+
+        with patch('server.STATE_FILE', state_file):
+            state = load_state()
+            assert isinstance(state, dict)
+            assert state["synced_ranges"] == []
+            assert "highlights" in state
+
+    def test_load_state_non_dict_falls_back_to_default(self, tmp_path):
+        """Valid JSON that is not an object (e.g. a list) should fall back to default"""
+        state_file = tmp_path / "state.json"
+        state_file.write_text("[]")  # valid JSON, but not the expected dict
+
+        with patch('server.STATE_FILE', state_file):
+            state = load_state()
+            assert isinstance(state, dict)
+            assert state["synced_ranges"] == []
+            assert "highlights" in state
+
     def test_write_state(self, tmp_path):
         """Test writing state file"""
         state_file = tmp_path / "state.json"
