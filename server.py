@@ -57,28 +57,54 @@ def validate_config():
 # ============================================================================
 
 def load_state() -> Dict:
-    """Load state file or create default"""
-    if STATE_FILE.exists():
-        with open(STATE_FILE, 'r') as f:
-            state = json.load(f)
-            # Backward compatibility: ensure highlights section exists
-            if "highlights" not in state:
-                state["highlights"] = {
-                    "last_import_timestamp": datetime.now(timezone.utc).isoformat(),
-                    "synced_ranges": [],
-                    "backfill_in_progress": False
-                }
-            return state
-    return {
-        "last_import_timestamp": datetime.now(timezone.utc).isoformat(),
-        "synced_ranges": [],
-        "backfill_in_progress": False,
-        "highlights": {
-            "last_import_timestamp": datetime.now(timezone.utc).isoformat(),
+    """Load state file or create default.
+
+    Resilient to a corrupt, empty, or unreadable state file: since write_state
+    is not atomic, an interrupted write can leave invalid JSON on disk. Rather
+    than crash on every subsequent start, fall back to the default state.
+    """
+    def _default_state() -> Dict:
+        now = datetime.now(timezone.utc).isoformat()
+        return {
+            "last_import_timestamp": now,
             "synced_ranges": [],
-            "backfill_in_progress": False
+            "backfill_in_progress": False,
+            "highlights": {
+                "last_import_timestamp": now,
+                "synced_ranges": [],
+                "backfill_in_progress": False
+            }
         }
-    }
+
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, 'r') as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(
+                f"State file {STATE_FILE} is corrupt or unreadable ({e}); "
+                f"falling back to default state"
+            )
+            return _default_state()
+
+        # Guard against valid-but-non-dict JSON (e.g. a bare list or number)
+        if not isinstance(state, dict):
+            logger.warning(
+                f"State file {STATE_FILE} did not contain a JSON object; "
+                f"falling back to default state"
+            )
+            return _default_state()
+
+        # Backward compatibility: ensure highlights section exists
+        if "highlights" not in state:
+            state["highlights"] = {
+                "last_import_timestamp": datetime.now(timezone.utc).isoformat(),
+                "synced_ranges": [],
+                "backfill_in_progress": False
+            }
+        return state
+
+    return _default_state()
 
 def write_state(state: Dict) -> None:
     """Write state file"""
