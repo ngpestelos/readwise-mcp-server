@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-01
+
+### Fixed
+- **Fresh installs failed to start**: `requirements.txt` allowed `mcp` 2.x, which removed `mcp.server.fastmcp`, so `server.py` failed on import. Pinned `mcp[cli]>=1.2.0,<2` until the server is migrated to the 2.x `MCPServer` API.
+
 ## 2026-02-22
 
 ### Fixed
